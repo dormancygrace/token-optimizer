@@ -13,6 +13,7 @@ import functools
 import json
 import sys
 from pathlib import Path
+from runtime_env import detect_runtime
 
 try:
     from runtime_env import claude_home as _get_claude_home
@@ -40,6 +41,8 @@ def _load_settings(settings_path):
 
 def detect_respond_to_bash(_session_data):
     """Return a finding if respondToBashCommands is not explicitly false."""
+    if detect_runtime() != 'claude':
+        return []
     if _get_claude_home is not None:
         settings_path = _get_claude_home() / "settings.json"
     else:

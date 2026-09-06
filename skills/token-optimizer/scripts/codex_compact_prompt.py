@@ -94,7 +94,10 @@ def _replace_or_append_config(config_text: str, prompt_path: Path, *, force: boo
         rf"(?ms)^{re.escape(MANAGED_BEGIN)}.*?^{re.escape(MANAGED_END)}\n?"
     )
     if managed_re.search(config_text):
-        return managed_re.sub(block, config_text), "updated"
+        clean, _ = _strip_managed_block(config_text)
+        # Root keys must precede TOML table headers. A comment does not end
+        # the previous table. Preserve unrelated entries added inside markers.
+        return block + '\n' + clean.lstrip('\n'), "updated"
 
     if COMPACT_FILE_RE.search(config_text) and not force:
         raise ValueError("config.toml already has experimental_compact_prompt_file; rerun with --force to replace")
@@ -105,8 +108,7 @@ def _replace_or_append_config(config_text: str, prompt_path: Path, *, force: boo
     if INLINE_COMPACT_RE.search(config_text):
         config_text = _comment_out_setting(INLINE_COMPACT_LINE_RE, config_text)
 
-    suffix = "" if not config_text or config_text.endswith("\n") else "\n"
-    return config_text + suffix + "\n" + block, "installed"
+    return block + '\n' + config_text, "installed"
 
 
 def plan_install(force: bool = False) -> dict[str, str | bool]:
@@ -138,7 +140,6 @@ def install(force: bool = False) -> str:
     home = codex_home()
     prompt_path = codex_io.ensure_codex_child(home, "token-optimizer", PROMPT_FILENAME)
     config_path = codex_io.ensure_codex_child(home, "config.toml")
-    codex_io.atomic_write(prompt_path, COMPACT_PROMPT)
 
     try:
         config_text, crlf = codex_io.read_config_text(config_path)
@@ -149,13 +150,25 @@ def install(force: bool = False) -> str:
         raise ValueError("config.toml already has compact_prompt; rerun with --force after reviewing precedence")
 
     updated, action = _replace_or_append_config(config_text, prompt_path, force=force)
+    codex_io.atomic_write(prompt_path, COMPACT_PROMPT)
     codex_io.atomic_write(config_path, updated, crlf=crlf)
     return action
 
 
 def _strip_managed_block(config_text: str) -> tuple[str, bool]:
     """Remove the Token Optimizer managed block; return (text, removed?)."""
-    new, n = _MANAGED_BLOCK_RE.subn("", config_text)
+    def strip_owned(match):
+        # App config writers may insert tables between these comments. Never
+        # delete arbitrary text merely because it falls inside our markers.
+        kept = []
+        for line in match.group(0).splitlines(keepends=True):
+            if line.strip() in (MANAGED_BEGIN, MANAGED_END):
+                continue
+            if COMPACT_FILE_RE.match(line):
+                continue
+            kept.append(line)
+        return ''.join(kept)
+    new, n = _MANAGED_BLOCK_RE.subn(strip_owned, config_text)
     return new, n > 0
 
 

@@ -1221,6 +1221,17 @@ def _resolve_session_model(session_id=None):
 
     Never raises. Always returns a normalized name ("opus"|"sonnet"|"haiku"|"sonnet" default).
     """
+    if detect_runtime() == 'codex':
+        # Claude message.model/environment/defaults are not Codex telemetry.
+        # Do not cache across model switches, or borrow another task's model.
+        path = codex_session.find_session_jsonl_by_id(session_id) if session_id else None
+        model = None
+        if path:
+            for record in codex_session._iter_json_records(path):
+                candidate = codex_session._extract_model(codex_session._payload(record))
+                if candidate:
+                    model = candidate
+        return model or (None if session_id else _codex_config_model()) or 'unknown'
     cache_key = session_id or "__env_or_recent__"
     if cache_key in _RESOLVED_MODEL_CACHE:
         return _RESOLVED_MODEL_CACHE[cache_key]
@@ -8741,7 +8752,9 @@ def generate_coach_data(focus=None, components=None, trends=None):
                 _claude_md_content = md_comp["content"]
                 break
         if not _claude_md_content:
-            for path in (CLAUDE_DIR / "CLAUDE.md", Path.home() / "CLAUDE.md", Path.cwd() / "CLAUDE.md"):
+            instruction_paths = ((RUNTIME_DIR / 'AGENTS.md', Path.cwd() / 'AGENTS.md') if is_codex
+                                 else (CLAUDE_DIR / "CLAUDE.md", Path.home() / "CLAUDE.md", Path.cwd() / "CLAUDE.md"))
+            for path in instruction_paths:
                 if path.exists():
                     try:
                         _claude_md_content = path.read_text(encoding="utf-8", errors="replace")[:50_000]
@@ -8792,7 +8805,7 @@ def generate_coach_data(focus=None, components=None, trends=None):
 
             # Enrich overpowered findings with counterfactual
             detail = f["evidence"]
-            if f["name"] == "overpowered" and recent_files:
+            if f["name"] == "overpowered" and recent_files and not is_codex:
                 try:
                     latest = _parse_session_jsonl(str(recent_files[0][0]))
                     if latest:
@@ -8850,7 +8863,7 @@ def generate_coach_data(focus=None, components=None, trends=None):
                         "name": "Quality Declining",
                         "severity": "high",
                         "detail": f"Average quality dropped from {prior_avg_q:.0f} to {recent_avg_q:.0f} over the last week",
-                        "fix": "Check for new MCP servers, growing CLAUDE.md, or longer sessions causing context fill",
+                        "fix": f"Check for new MCP servers, growing {instruction_label}, or longer sessions causing context fill",
                         "savings": "Quality recovery prevents retry waste (typically 5,000-20,000 tokens per failed turn)",
                     })
                     score -= 8
@@ -8879,7 +8892,7 @@ def generate_coach_data(focus=None, components=None, trends=None):
                         "severity": "medium",
                         "detail": f"Sessions averaging {recent_avg_dur:.0f} min (was {older_avg_dur:.0f} min). Longer sessions fill context faster",
                         "fix": "Use /compact proactively around the midpoint. Break large tasks into focused sessions",
-                        "savings": f"~{int(recent_avg_dur - older_avg_dur) * 200:,} fewer tokens of context bloat per session",
+                        "savings": "Duration alone does not measure token savings" if is_codex else f"~{int(recent_avg_dur - older_avg_dur) * 200:,} fewer tokens of context bloat per session",
                     })
                     score -= 5
 
@@ -8901,7 +8914,7 @@ def generate_coach_data(focus=None, components=None, trends=None):
                             "name": "Cache Hit Rate Dropping (Model Switches)",
                             "severity": "low",
                             "detail": f"Cache hit rate fell from {older_avg_chr:.0%} to {recent_avg_chr:.0%}, but {multi_model_pct:.0f}% of recent sessions switched models mid-session. Model switches invalidate the prompt cache (expected behavior)",
-                            "fix": "Pick one model per session when possible. Use /model at session start, not mid-conversation. Subagent model routing (Haiku/Sonnet) is fine, it runs in separate contexts",
+                            "fix": "Pick one model per session when possible. Select the model at session start. Subagents run in separate contexts",
                             "savings": "Avoiding mid-session model switches can recover 10-20% cache hit rate",
                         })
                         score -= 2
@@ -8910,8 +8923,8 @@ def generate_coach_data(focus=None, components=None, trends=None):
                             "name": "Cache Hit Rate Dropping",
                             "severity": "medium",
                             "detail": f"Cache hit rate fell from {older_avg_chr:.0%} to {recent_avg_chr:.0%}. Lower cache = higher cost per turn",
-                            "fix": "Check for new MCP servers or CLAUDE.md changes that shift the stable prefix. Avoid tools that rewrite existing context",
-                            "savings": "Each 10% cache drop costs ~$0.50/session at Opus rates",
+                            "fix": f"Check for new MCP servers or {instruction_label} changes that shift the stable prefix. Avoid tools that rewrite existing context",
+                            "savings": "Depends on the actual model and number of cached tokens" if is_codex else "Each 10% cache drop costs ~$0.50/session at Opus rates",
                         })
                         score -= 5
 
@@ -8957,8 +8970,8 @@ def generate_coach_data(focus=None, components=None, trends=None):
                     "name": "High Cost Per Session",
                     "severity": "medium",
                     "detail": f"${cost_per_session:.2f}/session average (${total_cost:.2f} across {session_count_t} sessions in {period} days)",
-                    "fix": "Route simple tasks to Sonnet/Haiku. Use /compact in long sessions. Archive unused skills",
-                    "savings": f"~${cost_per_session * 0.3:.2f}/session with routing + compression",
+                    "fix": "Use a suitable Codex model and reasoning effort for routine tasks. Compact at task boundaries" if is_codex else "Route simple tasks to Sonnet/Haiku. Use /compact in long sessions. Archive unused skills",
+                    "savings": "API-equivalent estimate, not subscription charges or measured savings" if is_codex else f"~${cost_per_session * 0.3:.2f}/session with routing + compression",
                 })
                 score -= 3
 
@@ -9018,6 +9031,20 @@ def generate_coach_data(focus=None, components=None, trends=None):
     # Build result
     overhead_pct = (totals["estimated_total"] / context_window * 100) if context_window else 0
     usable = context_window - totals["estimated_total"] - 33000  # subtract approx autocompact buffer
+    if is_codex and trends:
+        unpriced = [model for model in trends.get('model_mix', {}) if not _is_priced_model(model)]
+        history['unpriced_models'] = unpriced
+        history['cost_is_partial'] = bool(unpriced)
+        history['cost_basis'] = 'API-equivalent estimate; not subscription charges'
+        skipped = []
+        for path, _, _ in codex_session.find_all_jsonl_files(days=30):
+            try:
+                if path.stat().st_size > codex_session.MAX_PARSE_FILE_BYTES:
+                    skipped.append(path.name)
+            except OSError:
+                continue
+        history['skipped_large_sessions'] = skipped
+        history['cost_is_partial'] = bool(unpriced or skipped)
 
     result = {
         "snapshot": {
@@ -10938,14 +10965,15 @@ def _init_trends_db():
         )
         rows = conn.execute(
             "SELECT id, jsonl_path FROM session_log "
-            "WHERE session_uuid IS NULL AND jsonl_path IS NOT NULL"
+            "WHERE (session_uuid IS NULL OR session_uuid LIKE 'rollout-%') AND jsonl_path IS NOT NULL"
         ).fetchall()
         if rows:
             updates = []
             for row_id, jpath in rows:
                 stem = Path(jpath).stem  # strips directory and .jsonl suffix
                 if stem and stem != "unknown":
-                    updates.append((stem, row_id))
+                    canonical, _ = _extract_session_uuid(stem)
+                    updates.append((canonical or stem, row_id))
             if updates:
                 conn.executemany(
                     "UPDATE session_log SET session_uuid = ? WHERE id = ?", updates
@@ -11076,8 +11104,9 @@ def _init_trends_db():
             uuid_updates = []
             unjoinable_updates = []
             for row_id, sid in rows:
-                if sid and _UUID_PAT.match(sid):
-                    uuid_updates.append((sid, row_id))
+                canonical, _ = _extract_session_uuid(sid)
+                if canonical:
+                    uuid_updates.append((canonical, row_id))
                 elif sid and len(sid) <= 20 and "-" not in sid and sid not in (
                     "unknown", "test-123", "perf_test", "regtest", "demo"
                 ):
@@ -11161,9 +11190,9 @@ def _init_trends_db():
         ).fetchall()
         if ce_rows:
             ce_updates = [
-                (sid, row_id)
+                (_extract_session_uuid(sid)[0], row_id)
                 for row_id, sid in ce_rows
-                if sid and _UUID_PAT2.match(sid)
+                if _extract_session_uuid(sid)[0]
             ]
             if ce_updates:
                 conn.executemany(
@@ -11334,6 +11363,10 @@ def _extract_session_uuid(session_id):
     )
     if not session_id or session_id in ("unknown", "test-123", "perf_test", "regtest", "demo"):
         return None, False
+    if session_id.startswith('rollout-'):
+        match = re.search(r'([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$', session_id, re.I)
+        if match:
+            return match.group(1), False
     if _UUID_PAT.match(session_id):
         return session_id, False
     # Short opaque hex without dashes (17-char agent_ids from Claude Code)
@@ -11385,14 +11418,20 @@ def _log_savings_event(event_type, tokens_saved, session_id=None, detail=None, m
         # aggregation layer not to use the stored model for reprice attribution.
         tier = _load_pricing_tier()
         tier_data = PRICING_TIERS.get(tier, PRICING_TIERS["anthropic"])
-        if model:
+        if detect_runtime() == 'codex':
+            normalized = model or _resolve_session_model(session_id)
+            rates = _input_and_cached_read_rates(normalized)
+            if cost_per_mtok is None:
+                cost_per_mtok = rates[0] if rates else None
+        elif model:
             normalized = _normalize_model_name(model) or "sonnet"
         else:
             normalized = _resolve_session_model(session_id)
-        rates = tier_data["claude_models"].get(normalized, tier_data["claude_models"].get("sonnet", {}))
-        if cost_per_mtok is None:
-            cost_per_mtok = rates.get("input", 3.0)
-        cost_saved = tokens_saved * cost_per_mtok / 1e6
+        if detect_runtime() != 'codex':
+            rates = tier_data["claude_models"].get(normalized, tier_data["claude_models"].get("sonnet", {}))
+            if cost_per_mtok is None:
+                cost_per_mtok = rates.get("input", 3.0)
+        cost_saved = tokens_saved * cost_per_mtok / 1e6 if cost_per_mtok is not None else None
 
         conn = _init_trends_db()
         try:
@@ -11530,7 +11569,10 @@ def _get_compression_summary(days=30, since=None):
             comp = comp or 0
             cnt = cnt or 0
             # Per-model rate: use stored model if available, else current-session fallback.
-            if model:
+            if detect_runtime() == 'codex':
+                model_rates = _input_and_cached_read_rates(model)
+                rate = model_rates[0] if model_rates else 0.0
+            elif model:
                 norm_m = _normalize_model_name(model) or "sonnet"
                 rate = (
                     tier_data["claude_models"]
@@ -20278,8 +20320,17 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
 
     new_count = 0
     for filepath, mtime, project_name in files:
+        refresh_codex = False
         if _is_file_collected(conn, filepath):
-            continue
+            if _use_codex_session_adapter(filepath):
+                row = conn.execute('SELECT collected_at FROM session_log WHERE jsonl_path = ?',
+                                   (str(filepath),)).fetchone()
+                try:
+                    refresh_codex = not row[0] or mtime > datetime.fromisoformat(row[0]).timestamp()
+                except (ValueError, TypeError):
+                    refresh_codex = True
+            if not refresh_codex:
+                continue
 
         # Bounded per-run collection: never parse more than _COLLECT_MAX_PER_RUN new
         # sessions in one flush. `files` is newest-first, so recent sessions are always
@@ -20352,6 +20403,11 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
         session_platform = parsed.get("runtime") or detect_runtime()
 
         # Insert session_log
+        if refresh_codex:
+            # Only replace after parsing succeeds, in the same transaction as
+            # insertion and aggregate rebuild. Resumed tasks otherwise freeze
+            # forever at the first collection's counters.
+            conn.execute('DELETE FROM session_log WHERE jsonl_path = ?', (str(filepath),))
         cur = conn.execute(
             """INSERT OR IGNORE INTO session_log
                (jsonl_path, date, project, duration_minutes, input_tokens,
@@ -45752,7 +45808,8 @@ def run_ensure_health():
     try:
         already_shown = _read_config_flag("autoupdate_nudge_shown", False)
         qb_disabled = _read_config_flag("quality_bar_disabled", False)
-        if (_is_running_from_plugin_cache()
+        if (detect_runtime() == 'claude'
+                and _is_running_from_plugin_cache()
                 and not already_shown
                 and not qb_disabled):
             # User-visible onboarding tip. Emitted as a systemMessage so the

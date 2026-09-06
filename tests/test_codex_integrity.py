@@ -1,0 +1,131 @@
+"""Codex telemetry and config regression cases, with isolated runtime data."""
+import json
+import os
+import sys
+from pathlib import Path
+import pytest
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/token-optimizer/scripts'))
+import codex_session as cs
+import codex_compact_prompt as cp
+
+SID = '01234567-1234-1234-1234-123456789abc'
+
+def write_session(path, totals=(100, 200)):
+    records = [{'type': 'session_meta', 'payload': {'id': SID, 'cwd': '/project'}},
+               {'type': 'turn_context', 'payload': {'model': 'gpt-5.4'}}]
+    for n in totals:
+        usage = dict(input_tokens=n, cached_input_tokens=n // 2,
+                     output_tokens=n // 5, reasoning_output_tokens=n // 10)
+        records += [{'type': 'event_msg', 'payload': {'type': 'agent_message', 'message': 'hello'}},
+                    {'type': 'event_msg', 'payload': {'type': 'token_count', 'info': {
+                        'total_token_usage': usage, 'last_token_usage': usage}}}]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(map(json.dumps, records)), encoding='utf-8')
+    return path
+
+def test_inclusive_token_counts_and_duplicate_usage(tmp_path):
+    p = write_session(tmp_path / 'session.jsonl', (100, 100, 200))
+    parsed = cs.parse_session_jsonl(p)
+    assert parsed['total_input_tokens'] == 200
+    assert parsed['total_output_tokens'] == 40
+    assert parsed['total_cache_read'] == 100
+    assert parsed['cache_hit_rate'] == 0.5
+    assert parsed['model_usage_breakdown']['gpt-5.4'] == {
+        'fresh_input': 100, 'cache_read': 100, 'cache_create': 0, 'output': 40}
+    turns = cs.parse_session_turns(p)
+    assert turns[-1]['input_tokens'] == 200
+    assert turns[-1]['output_tokens'] == 40
+    assert cs.parse_jsonl_for_quality(p)['context_tokens'] == 240
+
+def test_latest_session_is_selected_before_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, 'session_roots', lambda: (tmp_path,))
+    old = write_session(tmp_path / 'old' / 'a.jsonl')
+    new = write_session(tmp_path / 'new' / 'z.jsonl')
+    os.utime(old, (1, 1))
+    assert cs.find_all_jsonl_files(days=90, max_files=1)[0][0] == new
+
+def test_compact_prompt_is_root_key_and_preserves_tables():
+    original = 'model = "gpt-5.4"\n[plugins.example]\nenabled = true\n'
+    updated, _ = cp._replace_or_append_config(original, Path('/prompt.md'), force=False)
+    parsed = tomllib.loads(updated)
+    assert parsed.pop('experimental_compact_prompt_file') == str(Path('/prompt.md'))
+    assert parsed == tomllib.loads(original)
+
+def test_repair_and_uninstall_preserve_entries_inside_old_markers():
+    original = ('[plugins.example]\nenabled = true\n' + cp.MANAGED_BEGIN + '\n'
+                'experimental_compact_prompt_file = "/old.md"\n'
+                '[hooks.state.example]\ntrusted_hash = "keep"\n' + cp.MANAGED_END + '\n')
+    repaired, _ = cp._replace_or_append_config(original, Path('/new.md'), force=False)
+    parsed = tomllib.loads(repaired)
+    assert parsed['experimental_compact_prompt_file'] == str(Path('/new.md'))
+    assert parsed['hooks']['state']['example']['trusted_hash'] == 'keep'
+    assert parsed['plugins']['example'] == {'enabled': True}
+    removed, _ = cp._strip_managed_block(original)
+    assert tomllib.loads(removed)['hooks']['state']['example']['trusted_hash'] == 'keep'
+
+@pytest.fixture
+def measure(tmp_path, monkeypatch):
+    monkeypatch.setenv('TOKEN_OPTIMIZER_RUNTIME', 'codex')
+    monkeypatch.setenv('TOKEN_OPTIMIZER_SNAPSHOT_DIR', str(tmp_path / 'data'))
+    import measure as m
+    monkeypatch.setattr(m, 'SNAPSHOT_DIR', tmp_path / 'data')
+    monkeypatch.setattr(m, 'TRENDS_DB', tmp_path / 'data/trends.db')
+    monkeypatch.setattr(m, 'detect_runtime', lambda: 'codex')
+    monkeypatch.setattr(cs, 'session_roots', lambda: (tmp_path / 'sessions',))
+    return m
+
+def test_model_attribution_is_session_scoped(measure, tmp_path, monkeypatch):
+    write_session(tmp_path / 'sessions' / f'rollout-2026-09-06-{SID}.jsonl')
+    monkeypatch.setenv('CLAUDE_MODEL', 'sonnet')
+    assert measure._resolve_session_model(SID) == 'gpt-5.4'
+    assert measure._resolve_session_model('missing-session') == 'unknown'
+    assert measure._extract_session_uuid(f'rollout-2026-09-06-{SID}') == (SID, False)
+
+def test_savings_use_openai_prices_and_unknown_is_not_sonnet(measure):
+    measure._log_savings_event('test', 1000, SID, model='gpt-5.4')
+    measure._log_savings_event('test', 1000, SID, model='gpt-future-unknown')
+    c = measure._init_trends_db()
+    rows = c.execute('SELECT model, cost_saved_usd FROM savings_events ORDER BY id').fetchall()
+    c.close()
+    assert rows[0] == ('gpt-5.4', 1000 * measure.OPENAI_MODEL_PRICING['gpt-5.4']['input'] / 1e6)
+    assert rows[1] == ('gpt-future-unknown', None)
+
+def test_claude_setting_detector_does_not_read_claude_in_codex(monkeypatch):
+    from detectors import respond_to_bash as detector
+    monkeypatch.setattr(detector, 'detect_runtime', lambda: 'codex')
+    monkeypatch.setattr(detector, '_load_settings', lambda p: pytest.fail('read Claude settings'))
+    assert detector.detect_respond_to_bash({}) == []
+
+def test_task_duration_excludes_days_between_resumes(tmp_path):
+    p = write_session(tmp_path / 'session.jsonl')
+    records = [json.loads(line) for line in p.read_text().splitlines()]
+    records[0]['timestamp'] = '2026-09-01T00:00:00Z'
+    records.append({'timestamp': '2026-09-06T00:00:00Z', 'type': 'event_msg',
+                    'payload': {'type': 'task_complete', 'duration_ms': 120000}})
+    p.write_text('\n'.join(map(json.dumps, records)))
+    parsed = cs.parse_session_jsonl(p)
+    assert parsed['duration_minutes'] == 2
+    assert parsed['wall_duration_minutes'] == 7200
+
+def test_collect_refreshes_resumed_codex_session(measure, tmp_path, monkeypatch):
+    p = write_session(tmp_path / 'sessions' / f'rollout-2026-09-06-{SID}.jsonl', (100,))
+    monkeypatch.setattr(measure, '_find_all_jsonl_files', lambda days: [(p, p.stat().st_mtime, 'project')])
+    monkeypatch.setattr(measure, '_find_subagent_jsonl_files', lambda p: [])
+    monkeypatch.setattr(measure, '_session_stale_waste_tokens', lambda p: 0)
+    monkeypatch.setattr(measure, 'score_session_quality', lambda p: {'score': 80, 'grade': 'A'})
+    monkeypatch.setattr(measure, '_needs_streaming_dedup_rebuild', lambda c: False)
+    monkeypatch.setattr(measure, '_needs_model_daily_rebuild', lambda c: False)
+    assert measure.collect_sessions(quiet=True) == 1
+    write_session(p, (100, 200))
+    import time
+    os.utime(p, (time.time() + 1, time.time() + 1))
+    assert measure.collect_sessions(quiet=True) == 1
+    c = measure._init_trends_db()
+    rows = c.execute('SELECT input_tokens,output_tokens,session_uuid FROM session_log').fetchall()
+    c.close()
+    assert rows == [(200, 40, SID)]

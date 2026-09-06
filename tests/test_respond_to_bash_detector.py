@@ -18,7 +18,7 @@ SCRIPTS = REPO / "skills" / "token-optimizer" / "scripts"
 
 
 def _run(code, env=None):
-    full_env = {**os.environ, "PYTHONUTF8": "1"}
+    full_env = {**os.environ, "PYTHONUTF8": "1", "TOKEN_OPTIMIZER_RUNTIME": "claude"}
     if env:
         full_env.update(env)
     return subprocess.run(
