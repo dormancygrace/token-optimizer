@@ -21,6 +21,7 @@ from runtime_env import codex_home
 
 CHARS_PER_TOKEN = 4
 MAX_PARSE_FILE_BYTES = 96 * 1024 * 1024
+LARGE_FILE_TAIL_BYTES = 8 * 1024 * 1024
 MAX_JSONL_LINE_CHARS = 8 * 1024 * 1024
 _UNKNOWN_MODEL = "unknown"
 _DEFAULT_MODEL = "codex"
@@ -132,20 +133,37 @@ def _iter_json_records(filepath: str | Path, *, skip_large_file: bool = True):
     bounded work more than perfect telemetry from those outlier transcripts.
     """
     path = Path(filepath)
-    if skip_large_file:
-        try:
-            if path.stat().st_size > MAX_PARSE_FILE_BYTES:
-                return
-        except OSError:
-            return
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
+        with path.open("rb") as handle:
+            size = path.stat().st_size
+            if skip_large_file and size > MAX_PARSE_FILE_BYTES:
+                # Keep identity, but never attribute the omitted interval to
+                # the model from the first turn. Only recent usage is sampled.
+                head = handle.readline(65536)
+                try:
+                    meta = json.loads(head)
+                    if isinstance(meta, dict) and meta.get('type') == 'session_meta':
+                        yield meta
+                except (ValueError, UnicodeError):
+                    pass
+                offset = max(handle.tell(), size - LARGE_FILE_TAIL_BYTES)
+                handle.seek(max(0, offset - 1))
+                if offset and handle.read(1) != b'\n':
+                    while True:
+                        fragment = handle.readline(65536)
+                        if not fragment or fragment.endswith(b'\n'):
+                            break
+            while True:
+                line = handle.readline(MAX_JSONL_LINE_CHARS + 1)
+                if not line:
+                    break
                 if len(line) > MAX_JSONL_LINE_CHARS:
+                    while line and not line.endswith(b'\n'):
+                        line = handle.readline(65536)
                     continue
                 try:
                     record = json.loads(line)
-                except json.JSONDecodeError:
+                except (ValueError, UnicodeError):
                     continue
                 if isinstance(record, dict):
                     yield record
@@ -289,6 +307,10 @@ def _project_name_from_file(path: Path) -> str:
 
 
 def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
+    try:
+        incomplete = Path(filepath).stat().st_size > MAX_PARSE_FILE_BYTES
+    except OSError:
+        return None
     skills_used: dict[str, int] = {}
     subagents_used: dict[str, int] = {}
     tool_calls: dict[str, int] = {}
@@ -342,6 +364,7 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
             rl = _extract_rate_limits(payload)
             if rl:
                 rate_limits_latest = rl
+                rate_limits_latest['observed_at'] = record.get('timestamp')
             turn_usage = _token_usage(payload, cumulative=False)
             # token_count also repeats the previous usage when only rate
             # limits change. Cumulative deltas count each API response once.
@@ -350,8 +373,10 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
                 if previous_usage and usage['input_tokens'] >= previous_usage['input_tokens']:
                     turn_usage = {k: max(0, usage[k] - previous_usage[k])
                                   for k in ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens')}
-                else:
+                elif not incomplete or previous_usage:
                     turn_usage = usage
+                elif not info.get('last_token_usage'):
+                    turn_usage = None
                 previous_usage = usage
             if turn_usage:
                 model_key = current_model if current_model != _UNKNOWN_MODEL else _DEFAULT_MODEL
@@ -362,6 +387,12 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
                 bucket["fresh_input"] += max(0, turn_usage["input_tokens"] - turn_usage["cached_input_tokens"])
                 bucket["cache_read"] += turn_usage["cached_input_tokens"]
                 bucket["output"] += turn_usage["output_tokens"]
+                if turn_usage['input_tokens'] or turn_usage['output_tokens']:
+                    bucket.setdefault('requests', []).append({
+                        'fresh_input': max(0, turn_usage['input_tokens'] - turn_usage['cached_input_tokens']),
+                        'cache_read': turn_usage['cached_input_tokens'],
+                        'output': turn_usage['output_tokens'],
+                    })
 
         elif payload_type == "collab_agent_spawn_end":
             # Modern subagent spawn. The legacy spawn_agent function_call path
@@ -405,7 +436,7 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
         elif payload_type == "mcp_tool_call_end":
             _append_duration(tool_durations_ms, payload.get("duration"))
 
-    if message_count == 0 and api_calls == 0:
+    if message_count == 0 and api_calls == 0 and not last_usage:
         return None
 
     wall_duration_minutes = 0
@@ -415,10 +446,10 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
     duration_minutes = sum(task_durations_ms) / 60000 if task_durations_ms else 0
 
     if last_usage:
-        fresh_input = max(0, last_usage["input_tokens"] - last_usage["cached_input_tokens"])
-        cache_read = last_usage["cached_input_tokens"]
+        fresh_input = sum(p['fresh_input'] for p in per_model_usage.values())
+        cache_read = sum(p['cache_read'] for p in per_model_usage.values())
         estimated_input = fresh_input + cache_read
-        estimated_output = last_usage["output_tokens"]
+        estimated_output = sum(p['output'] for p in per_model_usage.values())
         token_source = "codex_token_count"
     else:
         fresh_input = _estimate_tokens(input_text_chars + tool_output_chars)
@@ -443,6 +474,8 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
         }
 
     return {
+        "incomplete": incomplete,
+        "scan_mode": "recent_tail" if incomplete else "full",
         "version": version,
         "slug": slug,
         "topic": topic,

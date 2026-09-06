@@ -35,7 +35,9 @@ def test_inclusive_token_counts_and_duplicate_usage(tmp_path):
     assert parsed['total_output_tokens'] == 40
     assert parsed['total_cache_read'] == 100
     assert parsed['cache_hit_rate'] == 0.5
-    assert parsed['model_usage_breakdown']['gpt-5.4'] == {
+    parts = dict(parsed['model_usage_breakdown']['gpt-5.4'])
+    assert len(parts.pop('requests')) == 2
+    assert parts == {
         'fresh_input': 100, 'cache_read': 100, 'cache_create': 0, 'output': 40}
     turns = cs.parse_session_turns(p)
     assert turns[-1]['input_tokens'] == 200
@@ -48,6 +50,40 @@ def test_latest_session_is_selected_before_limit(tmp_path, monkeypatch):
     new = write_session(tmp_path / 'new' / 'z.jsonl')
     os.utime(old, (1, 1))
     assert cs.find_all_jsonl_files(days=90, max_files=1)[0][0] == new
+
+def test_large_log_samples_recent_usage_without_cumulative_overcount(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, 'MAX_PARSE_FILE_BYTES', 2048)
+    monkeypatch.setattr(cs, 'LARGE_FILE_TAIL_BYTES', 1500)
+    p = tmp_path / 'large.jsonl'
+    meta = {'type': 'session_meta', 'payload': {'id': SID}}
+    context = {'type': 'turn_context', 'payload': {'thread_settings': {'model': 'gpt-6-astra'}}}
+    usage = {'input_tokens': 100, 'cached_input_tokens': 50, 'output_tokens': 20}
+    event = {'type': 'event_msg', 'payload': {'type': 'token_count', 'info': {
+        'last_token_usage': usage,
+        'total_token_usage': {k: v * 1000 for k, v in usage.items()}}}}
+    p.write_text(json.dumps(meta) + '\n' + 'x' * 10000 + '\n' +
+                 '\n'.join(map(json.dumps, [context, event, event])), encoding='utf-8')
+    parsed = cs.parse_session_jsonl(p)
+    assert parsed['incomplete'] and parsed['scan_mode'] == 'recent_tail'
+    assert parsed['slug'] == SID
+    assert parsed['total_input_tokens'] == 100
+    assert parsed['total_output_tokens'] == 20
+    assert list(parsed['model_usage']) == ['gpt-6-astra']
+
+def test_oversized_record_does_not_hide_following_records(tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, 'MAX_JSONL_LINE_CHARS', 128)
+    p = tmp_path / 'lines.jsonl'
+    p.write_bytes(b'x' * 1000 + b'\n{"payload":{"model":"gpt-6-astra"}}\n')
+    assert list(cs._iter_json_records(p)) == [{'payload': {'model': 'gpt-6-astra'}}]
+
+def test_astra_pricing_uses_request_context_not_session_sum(measure):
+    m = measure
+    assert m._normalize_openai_model_name('gpt-6-astra-2026-09-01') == 'gpt-6-astra'
+    small = {'fresh_input': 100000, 'cache_read': 100000, 'output': 1000}
+    parts = {k: v * 3 for k, v in small.items()}
+    parts['requests'] = [small] * 3
+    assert m._cost_from_model_breakdown({'gpt-6-astra': parts}) == pytest.approx(3.45)
+    assert m._get_model_cost('gpt-6-astra', 200000, 1000, 100000, 0) == pytest.approx(4.275)
 
 def test_compact_prompt_is_root_key_and_preserves_tables():
     original = 'model = "gpt-5.4"\n[plugins.example]\nenabled = true\n'

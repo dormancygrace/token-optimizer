@@ -790,6 +790,8 @@ def _apply_sonnet_intro_pricing(as_of=None):
 _apply_sonnet_intro_pricing()
 
 OPENAI_MODEL_PRICING = {
+    # https://developers.openai.com/api/docs/models/gpt-6-astra
+    "gpt-6-astra": {"input": 10.0, "cache_read": 1.0, "cache_write": 12.50, "output": 50.0},
     # Prices per 1M tokens from OpenAI API pricing/model docs.
     # GPT-5.x family
     "gpt-5-codex": {"input": 1.25, "cache_read": 0.125, "output": 10.0},
@@ -824,6 +826,7 @@ OPENAI_MODEL_PRICING = {
     "o4-mini": {"input": 1.10, "cache_read": 0.275, "output": 4.40},
 }
 OPENAI_LONG_CONTEXT_PRICING = {
+    "gpt-6-astra": {"input": 20.0, "cache_read": 2.0, "cache_write": 25.0, "output": 75.0},
     "gpt-5.4": {"input": 5.0, "cache_read": 0.50, "output": 22.5},
     "gpt-5.5": {"input": 10.0, "cache_read": 1.0, "output": 45.0},
     "gpt-5.6-sol": {"input": 10.0, "cache_read": 1.0, "cache_write": 12.50, "output": 45.0},
@@ -1138,6 +1141,7 @@ def _normalize_openai_model_name(model):
     if not value or value in {"codex", "openai", "unknown"}:
         return None
     aliases = (
+        "gpt-6-astra",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
@@ -1340,6 +1344,12 @@ def _cost_from_model_breakdown(model_usage_breakdown, tier=None, cache_create_1h
     total = 0.0
     for model, parts in model_usage_breakdown.items():
         if not isinstance(parts, dict):
+            continue
+        # Long-context pricing applies per request, never to a session sum.
+        requests = parts.get('requests')
+        if isinstance(requests, list) and requests:
+            total += sum(_cost_from_model_breakdown({model: request}, tier=tier)
+                         for request in requests if isinstance(request, dict))
             continue
         part_1h = parts.get("cache_create_1h")
         part_5m = parts.get("cache_create_5m")
@@ -3163,6 +3173,8 @@ def detect_context_window():
         if configured_window:
             return remember((configured_window, "codex config: model_context_window"))
         model = os.environ.get("CODEX_MODEL") or os.environ.get("OPENAI_MODEL") or _codex_config_model()
+        if _normalize_openai_model_name(model) == 'gpt-6-astra':
+            return remember((1_050_000, 'OpenAI published GPT-6 Astra context window'))
         model_note = f" for {model}" if model else ""
         return remember((CODEX_DEFAULT_EFFECTIVE_CONTEXT_WINDOW, f"Codex conservative effective window{model_note} (override: TOKEN_OPTIMIZER_CONTEXT_SIZE)"))
     # Hermes: Hermes does not expose a model field in
@@ -3294,6 +3306,10 @@ def _interpolate_curve(value, curve):
 
 def _quality_curve_for_model(model):
     m = str(model or "").lower()
+    if 'gpt-6-astra' in m:
+        # No calibrated Astra retrieval curve is bundled. Label the proxy
+        # explicitly instead of silently treating Astra as an Anthropic model.
+        return 'openai-gpt-5.5-proxy-for-astra (uncalibrated)', _OPENAI_GPT55_MRCR_TOKENS, 'absolute_tokens'
     if "gemini" in m:
         return "google-gemini", _GEMINI_MRCR_TOKENS, "absolute_tokens"
     if "gpt-5.5" in m:
@@ -5195,9 +5211,14 @@ def codex_state_report(as_json=False):
         print("\nGoals: none active")
 
     rl = summary.get("rate_limits") or {}
-    primary = rl.get("primary")
-    if isinstance(primary, dict) and primary.get("used_percent") is not None:
-        print(f"\nRate limit (primary): {primary['used_percent']:.0f}% used")
+    for key in ('primary', 'secondary'):
+        window = rl.get(key)
+        if isinstance(window, dict) and window.get('used_percent') is not None:
+            mins = window.get('window_minutes')
+            label = f'{mins} minutes' if mins else key
+            print(f"\nAccount quota ({label}, logged snapshot): {window['used_percent']:.0f}% used")
+    if rl:
+        print(f"Quota observed at: {rl.get('observed_at') or 'unavailable'}")
     if summary.get("effort"):
         print(f"Effort (dominant this session): {summary['effort']}")
     if summary.get("task_duration_ms_max"):
@@ -8943,7 +8964,7 @@ def generate_coach_data(focus=None, components=None, trends=None):
                     "severity": "high",
                     "detail": f"{d_pct:.0f}% of recent sessions scored D or below",
                     "fix": "Run /token-optimizer for a full audit. Common causes: bloated tool outputs, stale reads, long sessions without compaction",
-                    "savings": "Improving average grade from D to B typically saves 15-30% of session cost",
+                    "savings": "Quality grades do not measure subscription quota savings" if is_codex else "Improving average grade from D to B typically saves 15-30% of session cost",
                 })
                 score -= 8
             elif d_pct > 30:
@@ -8952,7 +8973,7 @@ def generate_coach_data(focus=None, components=None, trends=None):
                     "severity": "medium",
                     "detail": f"{d_pct:.0f}% of recent sessions scored D or below",
                     "fix": "Focus on the longest sessions first. Quality degrades fastest after context passes 60%",
-                    "savings": "Each grade improvement saves ~5-10% per session",
+                    "savings": "Quality grades do not measure subscription quota savings" if is_codex else "Each grade improvement saves ~5-10% per session",
                 })
                 score -= 4
 
@@ -8965,7 +8986,7 @@ def generate_coach_data(focus=None, components=None, trends=None):
             history["total_cost_usd"] = round(total_cost, 2)
             history["cost_per_session_usd"] = round(cost_per_session, 4)
             history["sessions_in_period"] = session_count_t
-            if cost_per_session > 2.0:
+            if cost_per_session > 2.0 and not is_codex:
                 patterns_bad.append({
                     "name": "High Cost Per Session",
                     "severity": "medium",
@@ -9043,7 +9064,7 @@ def generate_coach_data(focus=None, components=None, trends=None):
                     skipped.append(path.name)
             except OSError:
                 continue
-        history['skipped_large_sessions'] = skipped
+        history['partial_large_sessions'] = skipped
         history['cost_is_partial'] = bool(unpriced or skipped)
 
     result = {
@@ -20458,6 +20479,10 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
         if cur.rowcount != 1:
             continue
 
+        if session_platform == 'codex':
+            conn.execute('UPDATE session_log SET incomplete = ? WHERE jsonl_path = ?',
+                         (int(bool(parsed.get('incomplete'))), str(filepath)))
+
         new_count += 1
         # Bank progress every batch so an interrupted deep backfill (a hook timeout
         # mid-parse) persists what it already collected instead of rolling back the
@@ -20718,7 +20743,7 @@ def _query_trends_db(conn, days):
                   avg_call_gap_seconds, max_call_gap_seconds, p95_call_gap_seconds, skills_json,
                   subagents_json, model_usage_json, slug, topic, project,
                   model_usage_breakdown_json,
-                  quality_score, quality_grade
+                  quality_score, quality_grade, incomplete
            FROM session_log WHERE date >= ? ORDER BY date DESC""",
         (cutoff,),
     ).fetchall()
@@ -20814,6 +20839,8 @@ def _query_trends_db(conn, days):
         jsonl_path = sr["jsonl_path"]
 
         sd = {
+            "incomplete": bool(sr['incomplete']),
+            "statistics_note": 'Recent log sample only' if sr['incomplete'] else None,
             "duration_minutes": round(sr["duration_minutes"] or 0, 1),
             "input_tokens": inp_total,
             "output_tokens": out_total,
@@ -21128,7 +21155,9 @@ def _collect_trends_from_jsonl(days=30):
         uncached = max(0, s["total_input_tokens"] - cr - cc)
         cc_1h = s.get("total_cache_create_1h", 0) or 0
         cc_5m = s.get("total_cache_create_5m", 0) or 0
-        if cc_1h or cc_5m:
+        if s.get('runtime') == 'codex' and s.get('model_usage_breakdown'):
+            session_cost = _cost_from_model_breakdown(s['model_usage_breakdown'], tier=pricing_tier)
+        elif cc_1h or cc_5m:
             session_cost = _get_model_cost(dom_model, uncached, s["total_output_tokens"], cr, cc,
                                            tier=pricing_tier, cache_create_1h=cc_1h, cache_create_5m=cc_5m)
         else:

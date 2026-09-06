@@ -3161,9 +3161,16 @@ var DB = (function() {
         } else {
           rows += '<div class="bar-row"><span class="bar-label">Goals</span><span class="bar-value">none active</span></div>';
         }
-        var rl = cs.rate_limits && cs.rate_limits.primary;
-        if (rl && rl.used_percent != null) {
-          rows += '<div class="bar-row"><span class="bar-label">Rate limit</span><span class="bar-value">' + Math.round(rl.used_percent) + '% used (primary)</span></div>';
+        ['primary', 'secondary'].forEach(function(key) {
+          var rl = cs.rate_limits && cs.rate_limits[key];
+          if (!rl || rl.used_percent == null) return;
+          var mins = rl.window_minutes;
+          var period = mins === 10080 ? '7 days' : mins === 300 ? '5 hours' : mins ? mins + ' minutes' : key;
+          var remaining = Math.max(0, Math.min(100, 100 - rl.used_percent));
+          rows += '<div class="bar-row"><span class="bar-label">Quota (' + esc(period) + ')</span><span class="bar-value">' + Math.round(rl.used_percent) + '% used · ' + Math.round(remaining) + '% remaining</span></div>';
+        });
+        if (cs.rate_limits) {
+          rows += '<div class="note">Account quota snapshot from session log' + (cs.rate_limits.observed_at ? ': ' + esc(cs.rate_limits.observed_at) : ' (timestamp unavailable)') + '. Missing windows are unavailable, not zero.</div>';
         }
         if (cs.effort) {
           rows += '<div class="bar-row"><span class="bar-label">Effort</span><span class="bar-value">' + esc(String(cs.effort)) + '</span></div>';
@@ -3554,11 +3561,11 @@ var DB = (function() {
       : 'fresh:' + fn(t.total_fresh_input || 0) + ' · cache-write:' + fn(t.total_cache_create || 0) + ' · out:' + fn(t.total_output_tokens || 0);
     var codexCostNote = '';
     if (isCodex && typeof t.total_cost_usd === 'number') {
-      codexCostNote = '<div style="font-size:10px;color:var(--c-text-dim);margin-top:2px">API-equivalent known cost: $' + t.total_cost_usd.toFixed(2);
+      codexCostNote = '<details style="font-size:10px;color:var(--c-text-dim);margin-top:2px"><summary>Optional API-price comparison (not Codex subscription usage)</summary>API-equivalent estimate: $' + t.total_cost_usd.toFixed(2);
       if (typeof t.cost_coverage_pct === 'number' && t.cost_coverage_pct < 100) {
         codexCostNote += ' · pricing coverage: ' + t.cost_coverage_pct.toFixed(1) + '%';
       }
-      codexCostNote += '</div>';
+      codexCostNote += ' · Tokens cannot be converted into subscription quota percentages.</details>';
       if (t.cost_note) {
         codexCostNote += '<div style="font-size:10px;color:var(--c-warning);margin-top:2px">' + esc(t.cost_note) + '</div>';
       }
@@ -3858,8 +3865,8 @@ var DB = (function() {
     var gitCommits = (data.trends && data.trends.git_commits) || {};
     var isCodex = data.runtime === 'codex';
 
-    var html = '<table class="session-table"><thead><tr>' +
-      '<th>Date</th><th>Sessions</th><th>Input Tokens</th><th>Output Tokens</th><th>Cost</th>' +
+    var html = (isCodex ? '<p>Codex subscription: token counts are telemetry, not charges or quota percentages. API estimates are optional comparisons. Sessions marked "recent sample" contain only the tail of a large log; period totals are partial.</p>' : '') + '<table class="session-table"><thead><tr>' +
+      '<th>Date</th><th>Sessions</th><th>Input Tokens</th><th>Output Tokens</th><th>' + (isCodex ? 'API comparison' : 'Cost') + '</th>' +
       (isCodex ? '<th>Cache</th>' : '<th>Skills Used</th>') +
       '<th>Commits</th>' +
       '</tr></thead><tbody>';
@@ -3889,6 +3896,7 @@ var DB = (function() {
         if ((sd.cache_hit_rate || 0) > 0) { dayCacheSum += sd.cache_hit_rate || 0; dayCacheCount += 1; }
       });
       var dayCostStr = dayCost >= 1 ? '$' + dayCost.toFixed(2) : dayCost > 0 ? '$' + dayCost.toFixed(3) : '';
+      if (isCodex && dayCostStr) dayCostStr = '<details><summary>Estimate</summary>' + dayCostStr + '</details>';
       var dayCacheStr = dayCacheCount ? (dayCacheSum / dayCacheCount * 100).toFixed(0) + '% cached input' : 'not logged';
 
       html += '<tr class="daily-row" data-date="' + esc(d.date) + '" style="cursor:pointer;">' +
@@ -3913,13 +3921,14 @@ var DB = (function() {
         '<th title="' + (isCodex ? 'Cached input share from Codex token_count logs.' : 'Approximate cache hit rate. Higher means ' + esc(data.runtime_label || 'Claude Code') + ' reused more previously cached context instead of reprocessing it.') + '" style="cursor:help">Cache</th>' +
         (isCodex ? '' : '<th title="How much of cache writing used 1-hour TTL versus 5-minute TTL. Longer TTL keeps cache reusable for longer." style="cursor:help">TTL</th>') +
         '<th title="Time between assistant API calls in this session. Helpful for seeing whether a session was steady or stop-start." style="cursor:help">Pacing</th>' +
-        '<th title="Estimated API-equivalent cost for the session." style="cursor:help">Cost</th>' +
+        '<th title="Estimated API-equivalent cost; not subscription charges or quota usage." style="cursor:help">' + (isCodex ? 'API comparison' : 'Cost') + '</th>' +
         '<th title="' + (isCodex ? 'Estimated context quality score from local Codex session events.' : 'Session quality score. Higher is healthier; lower means more context rot or risk.') + '" style="cursor:help">Q' + (isCodex ? ' (est.)' : '') + '</th>' +
         '<th title="Dominant ' + esc(data.runtime_label || 'Claude Code') + ' model used in the session." style="cursor:help">Model</th>' +
         '<th title="Short topic extracted from the session so you can recognize the thread." style="cursor:help">Topic</th>' +
         '</tr></thead><tbody>';
       (d.session_details || []).forEach(function(sd, si) {
         var sdTopic = sd.topic || '';
+        if (isCodex && sd.incomplete) sdTopic = '[recent sample] ' + sdTopic;
         // Quality overlay
         var qs = sd.quality_score || 0;
         var qGrade = sd.quality_grade || (qs >= 90 ? 'S' : qs >= 80 ? 'A' : qs >= 70 ? 'B' : qs >= 55 ? 'C' : qs >= 40 ? 'D' : 'F');
@@ -3936,6 +3945,7 @@ var DB = (function() {
         // Cost display
         var costVal = sd.cost_usd || 0;
         var costStr = costVal >= 1 ? '$' + costVal.toFixed(2) : costVal > 0 ? '$' + costVal.toFixed(3) : '';
+        if (isCodex && costStr) costStr = '<details><summary>Estimate</summary>' + costStr + '</details>';
         var modelStr = sd.model || '';
         var ttl1h = sd.cache_create_1h_tokens || 0;
         var ttl5m = sd.cache_create_5m_tokens || 0;
