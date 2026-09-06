@@ -46146,6 +46146,11 @@ def run_verbosity_steer(transcript_path=None, quiet=True, session_id=None):
                 )
             except (TypeError, ValueError):
                 have_sid = ""
+            if detect_runtime() == 'codex':
+                # Codex cache names retain rollout timestamps, while live hook
+                # payloads carry the UUID. Compare canonical IDs on both sides.
+                have_sid = _extract_session_uuid(have_sid)[0] or have_sid
+                want_sid = _extract_session_uuid(want_sid)[0] or want_sid
             if not have_sid or have_sid == "unknown" or have_sid != want_sid:
                 # Say so. If this mismatch is structural to the environment
                 # (container path translation, WSL mounts, a runtime emitting a

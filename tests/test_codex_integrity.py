@@ -85,6 +85,20 @@ def test_astra_pricing_uses_request_context_not_session_sum(measure):
     assert m._cost_from_model_breakdown({'gpt-6-astra': parts}) == pytest.approx(3.45)
     assert m._get_model_cost('gpt-6-astra', 200000, 1000, 100000, 0) == pytest.approx(4.275)
 
+def test_rollout_nudge_identity_matches_only_its_live_task(measure, tmp_path, monkeypatch):
+    m = measure
+    transcript = write_session(tmp_path / f'rollout-2026-09-06-{SID}.jsonl')
+    cache_path = tmp_path / f'quality-cache-{transcript.stem}.json'
+    cache_path.write_text('{}')
+    monkeypatch.setattr(m, '_quality_cache_path_for', lambda fp=None: cache_path)
+    monkeypatch.setattr(m, '_read_quality_cache', lambda cp: {
+        'fill_pct': 47, 'score': 73, 'session_efficiency': 60,
+        'nudge_count': 0, 'last_nudge_time': 0})
+    monkeypatch.setattr(m, '_log_savings_event', lambda *a, **kw: None)
+    assert m.run_verbosity_steer(str(transcript), quiet=True, session_id=SID)
+    assert not m.run_verbosity_steer(str(transcript), quiet=True,
+                                    session_id='11234567-1234-1234-1234-123456789abc')
+
 def test_compact_prompt_is_root_key_and_preserves_tables():
     original = 'model = "gpt-5.4"\n[plugins.example]\nenabled = true\n'
     updated, _ = cp._replace_or_append_config(original, Path('/prompt.md'), force=False)
