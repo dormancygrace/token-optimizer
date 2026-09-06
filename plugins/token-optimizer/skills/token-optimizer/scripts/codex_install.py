@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import shlex
@@ -57,13 +58,8 @@ def _hook_command(script: str, *args: str, redirect_quiet: bool = False,
         # bash and python-launcher.sh (several CreateProcess calls per hook).
         # list2cmdline applies native Windows quoting for paths with spaces.
         #
-        # Verified 2026-08-05 against Codex CLI source: codex-rs/hooks/src/
-        # engine/command_runner.rs default_shell_command() spawns hooks as
-        # `%COMSPEC% /C <command>` (fallback cmd.exe) on Windows unless the
-        # user overrides the hook shell in config. So the cmd.exe syntax below
-        # (setlocal, for /f, 2^>NUL, >NUL 2>&1) is CORRECT here — do NOT
-        # "bash-ify" it. The inverse bug: Claude Code runs hooks via
-        # Git Bash, so measure.py's Claude-facing commands are POSIX-shaped.
+        # Codex uses %COMSPEC% /C on native Windows, not Git Bash. Avoid
+        # batch-only SETLOCAL semantics and nested shell quoting here.
         _win_env = ''.join(
             f'set "{k}={v}" && ' for k, v in extra_env.items()
         )
@@ -71,31 +67,36 @@ def _hook_command(script: str, *args: str, redirect_quiet: bool = False,
             # CMD needs a Windows-native counterpart to the POSIX runtime
             # resolver below. Keep the baked path as a fail-open fallback when
             # the version scan cannot run.
-            base = str(root.parent)
-            ps_base = base.replace("'", "''")
-            ps_command = (
-                "$ErrorActionPreference='SilentlyContinue'; "
-                f"Get-ChildItem -LiteralPath '{ps_base}' -Directory | "
-                "Where-Object { $_.Name -match '^\\d+\\.\\d+\\.\\d+$' } | "
-                "Sort-Object { [version]$_.Name } -Descending | "
-                "Select-Object -First 1 -ExpandProperty Name"
+            # SETLOCAL does not enable delayed expansion in a cmd /C command
+            # string (outside a batch file). Resolve in the existing Python
+            # process instead. Encoding keeps paths/arguments containing CMD
+            # metacharacters out of the shell, without adding a PowerShell hop.
+            bootstrap = (
+                "import os, re, runpy, sys\n"
+                "from pathlib import Path\n"
+                f"root = Path({str(root)!r})\n"
+                "try:\n"
+                "    versions = [p for p in root.parent.iterdir() if p.is_dir() "
+                "and re.fullmatch(r'\\d+\\.\\d+\\.\\d+', p.name)]\n"
+                "    root = max(versions, key=lambda p: tuple(map(int, p.name.split('.'))), default=root)\n"
+                "except OSError:\n"
+                "    pass\n"
+                "os.environ['TOKEN_OPTIMIZER_RUNTIME'] = 'codex'\n"
+                "os.environ['TOKEN_OPTIMIZER_RUNTIME_ROOT'] = str(root)\n"
+                f"os.environ.update({extra_env!r})\n"
+                "runner = root / 'hooks' / 'run.py'\n"
+                f"sys.argv = [str(runner), {script!r}, *{list(args)!r}]\n"
+                "sys.path.insert(0, str(runner.parent))\n"
+                "runpy.run_path(str(runner), run_name='__main__')\n"
             )
-            resolver = subprocess.list2cmdline(
-                ["powershell", "-NoProfile", "-Command", ps_command]
-            )
-            prefix = (
-                'setlocal EnableDelayedExpansion && '
-                'set "TOKEN_OPTIMIZER_RUNTIME=codex" && '
-                f'set "TOKEN_OPTIMIZER_RUNTIME_ROOT={root}" && '
-                f'for /f "delims=" %R in (\'{resolver} 2^>NUL\') '
-                f'do @set "TOKEN_OPTIMIZER_RUNTIME_ROOT={base}\\%R" && '
-                f'{_win_env}'
-            )
+            encoded = base64.b64encode(bootstrap.encode('utf-8')).decode('ascii')
             python = subprocess.list2cmdline([sys.executable])
-            script_args = subprocess.list2cmdline([script, *args])
             command = (
-                f'{prefix}{python} "!TOKEN_OPTIMIZER_RUNTIME_ROOT!\\hooks\\run.py" '
-                f"{script_args}"
+                f'{python} -c "exec(__import__(\'base64\').b64decode(\'{encoded}\'))"'
+                # Keep the existing ownership marker visible to install,
+                # uninstall, doctor, and dashboard checks. The bootstrap
+                # replaces sys.argv before dispatching the runner.
+                ' token-optimizer/scripts/windows-launcher'
             )
         else:
             prefix = f'set "TOKEN_OPTIMIZER_RUNTIME=codex" && {_win_env}'
@@ -355,7 +356,9 @@ def _load_hooks(path: Path) -> dict[str, Any]:
 
 
 def _is_token_optimizer_group(group: Any) -> bool:
-    return TOKEN_OPTIMIZER_MARKER in json.dumps(group, sort_keys=True)
+    serialized = json.dumps(group, sort_keys=True)
+    return (TOKEN_OPTIMIZER_MARKER in serialized
+            or "TOKEN_OPTIMIZER_RUNTIME_ROOT=" in serialized)
 
 
 def _merge_hooks(
