@@ -18008,6 +18008,7 @@ _COUNTED_SE_EVENT_TYPES = (
 _COUNTED_CE_EXCLUDED_FEATURES = (
     "quality_nudge", "loop_detection", "cohort_demoted", "fresh_session_nudge",
     "cache_drop_warning", "first_read_edit_followup",
+    "delta_read",  # read_cache emits both ledgers; savings_events owns this key
 )
 # Ledger events count from here; earlier months use transcript markers instead
 # (the Mar-Apr ledger logged 4+13 events against 73+232 physical markers).
@@ -18029,7 +18030,7 @@ def _counted_event_utc(ts):
     timestamps are UTC. Convert local-naive -> UTC-naive (DST-correct for the
     event's own date via the system tz database). Never raises."""
     try:
-        dt = datetime.fromisoformat(str(ts)[:26])
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         return dt.astimezone(timezone.utc).replace(tzinfo=None)
     except (ValueError, TypeError, OSError):
         return None
@@ -18249,6 +18250,14 @@ def _update_counted_cumulative(conn, max_sessions=_COUNTED_MAX_SESSIONS_PER_PASS
              "unmeasured_events": 0}
     try:
         started = time.monotonic()
+        # Earlier versions compounded the delta_read mirror as a second removal.
+        # Delete only those derived duplicates; keep both source telemetry rows.
+        duplicates = conn.execute(
+            "DELETE FROM counted_reread WHERE event_key IN "
+            "(SELECT 'ce:'||id FROM compression_events WHERE feature='delta_read')")
+        stats["duplicate_rows_removed"] = max(0, duplicates.rowcount)
+        if duplicates.rowcount:
+            conn.commit()
         events = _counted_candidate_events(conn)
         if not events:
             return stats
@@ -18414,10 +18423,15 @@ def _counted_marker_backfill(conn, max_files=_COUNTED_MARKER_FILES_PER_PASS,
 
 
 def _purge_counted_without_transcripts(conn):
-    """Remove counted rows that have no real transcript to support them."""
+    """Remove never-verified fallback rows, preserving evidence already counted.
+
+    Transcript rotation must not erase stored savings. A recorded mtime proves
+    the row was computed from a real transcript, even if that file is now gone.
+    """
     try:
         rows = conn.execute(
-            "SELECT rowid, session_uuid FROM counted_reread"
+            "SELECT rowid, session_uuid FROM counted_reread "
+            "WHERE transcript_mtime IS NULL"
         ).fetchall()
     except sqlite3.Error:
         return 0
@@ -18451,26 +18465,49 @@ def _counted_backfill_all(conn, quiet=True):
     return stats
 
 
-def _counted_cumulative_summary():
+def _counted_cumulative_summary(days=None, now=None):
     """Cheap SELECT-only rollup of counted_reread for the Counted-to-date card.
 
     NEVER walks transcripts (the collect pass owns that); a dashboard regen
-    pays one aggregate query. Fail-open to {"available": False}."""
+    pays aggregate queries only. With days, select removals made in that period;
+    their later rereads stay attributed to the removal (not to the reread date).
+    This is an event cohort, not a claim of dollars accrued inside an exact window.
+    Fail-open to {"available": False}."""
     out = {"available": False}
+    if days is not None and detect_runtime() != "claude":
+        return out
     if not TRENDS_DB.exists():
         return out
     try:
+        where, params = "", ()
+        end = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        start = end - timedelta(days=max(1, int(days))) if days is not None else None
         conn = _init_trends_db()
         try:
+            if start is not None:
+                def event_epoch(ts, source):
+                    # Pre-ledger marker timestamps were stored as UTC-naive;
+                    # hook events are local-naive, or explicitly offset-aware.
+                    if source == "mk":
+                        try:
+                            value = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                            return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
+                        except (ValueError, TypeError, OSError):
+                            return None
+                    value = _counted_event_utc(ts)
+                    return value.replace(tzinfo=timezone.utc).timestamp() if value else None
+                conn.create_function("counted_event_epoch", 2, event_epoch)
+                where = " WHERE counted_event_epoch(event_ts, source) >= ? AND counted_event_epoch(event_ts, source) <= ?"
+                params = (start.timestamp(), end.timestamp())
             row = conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(tokens),0), "
                 "COALESCE(SUM(oneshot_usd),0), COALESCE(SUM(reread_tokens),0), "
                 "COALESCE(SUM(reread_usd),0), MIN(event_month), MAX(computed_at) "
-                "FROM counted_reread").fetchone()
+                "FROM counted_reread" + where, params).fetchone()
             months = conn.execute(
                 "SELECT event_month, ROUND(COALESCE(SUM(oneshot_usd),0) + "
                 "COALESCE(SUM(reread_usd),0), 2) FROM counted_reread "
-                "GROUP BY event_month ORDER BY event_month").fetchall()
+                + where + " GROUP BY event_month ORDER BY event_month", params).fetchall()
             try:
                 done = conn.execute(
                     "SELECT value FROM token_optimizer_meta WHERE key = ?",
@@ -18482,11 +18519,14 @@ def _counted_cumulative_summary():
         finally:
             conn.close()
         n, tok, oneshot, rr_tok, rr_usd, first_month, computed_at = row
-        if not n:
+        if not n and days is None:
             return out
         return {
             "available": True,
             "events": int(n),
+            "attribution": "removal_time",
+            "period_start": start.isoformat() if start else None,
+            "period_end": end.isoformat(),
             "removed_tokens": int(tok),
             "oneshot_usd": round(float(oneshot), 2),
             "reread_tokens": int(rr_tok),
@@ -18539,6 +18579,10 @@ def _dashboard_savings_data(days=30, include_billing_mode=False, fail_open=False
         savings_data["counted_cumulative"] = _counted_cumulative_summary()
     except Exception:
         savings_data["counted_cumulative"] = {"available": False}
+    try:
+        savings_data["counted_period"] = _counted_cumulative_summary(days=days)
+    except Exception:
+        savings_data["counted_period"] = {"available": False}
     if include_billing_mode:
         try:
             savings_data["billing_mode"] = keepwarm_billing_mode()
@@ -39843,16 +39887,16 @@ def runway_snapshot(days=30, now=None):
                     try:
                         end_utc = datetime.now(timezone.utc).replace(tzinfo=None)
                         if since_iso:
-                            start_utc = datetime.fromisoformat(since_iso)
-                            if start_utc.tzinfo is not None:
-                                start_utc = start_utc.astimezone(timezone.utc).replace(tzinfo=None)
+                            start_utc = _counted_event_utc(since_iso)
                         else:
                             start_utc = end_utc - timedelta(days=wdays)
                         counted = _counted_window_summary(conn, start_utc, end_utc)
                     finally:
                         conn.close()
                     if counted.get("available"):
-                        ctx = float(counted.get("total_usd", 0.0) or 0.0)
+                        # Keep setup, output, unmatched events and other logged
+                        # savings. Their initial removals are already in merged_ctx.
+                        ctx = merged_ctx + float(counted.get("reread_usd", 0.0) or 0.0)
                         counted_window = True
                 except Exception:
                     # Older databases without counted_reread retain the legacy
@@ -43993,7 +44037,7 @@ def _savings_since_install():
             float((full.get(k) or {}).get("cost_saved_usd", 0) or 0)
             for k in (
                 "behavioral_estimate", "uncaptured_runtime", "mcp_cap_estimated",
-                "contamination_exit", "handover_rerun", "resume_lean_estimated",
+                "contamination_exit", "handover_rerun", "resume_lean_estimated", "verbosity_steer",
             )
         )
         # Avoided-search: prefer the deterministic observed hint->read measure

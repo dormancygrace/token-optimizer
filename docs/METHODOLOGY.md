@@ -469,3 +469,18 @@ sessions immediately), then read the transformation + measured tiers. The baseli
 client's *own* sessions at their *own* pre-optimization mix, frozen, so the gain is defensible
 as "your activity, your old way, vs now." Always present it with the §3.5 caveats — the honesty
 is the credibility.
+
+
+## Action savings and context history (v5.13.10)
+
+The action card combines three separately labelled amounts for the selected period:
+
+1. Initial logged savings, including output, setup and realized routing. Some dollar rates are allocated from the recorded session model mix.
+2. Modeled repeat reads from `counted_reread`, for removals made in that period. Only `reread_usd` is added: initial removals already occur in the logged total. An event without a transcript retains its logged value but gets no invented repeat reads.
+3. Other estimates, including lean resumes, concise-output nudges and the existing behavioral estimators. Opportunities remain excluded.
+
+Repeat-read value is attributed to the removal date. Later benefit belongs to that removal until the recorded compaction, even across a date boundary. This is an action-period view, not exact per-turn accrual inside a calendar interval. The method assumes the untrimmed context would otherwise have stayed until that compaction. Stored dollar values retain their recorded valuation rates.
+
+The lifetime **Context savings** card includes initial context removals and modeled repeat reads only. It shows the same ledger's period subtotal for comparison. It excludes output, setup, routing and other estimates, so it is narrower than the action card. Historical marker entries may use estimated removal sizes. Previously transcript-verified records survive transcript rotation. Duplicate `delta_read` telemetry is counted only through `savings_events`.
+
+The transformation estimate overlaps with these action totals and must not be added to them. Its displayed percentage is the reduction between the same actual and counterfactual costs used for its dollar headline. API calls remain a proxy for workload, not a measure of task quality or difficulty.
