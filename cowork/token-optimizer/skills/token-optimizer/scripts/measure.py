@@ -25842,6 +25842,9 @@ def _install_launchd_daemon(dry_run=False, soft_fail=False, effective_host=None)
     overwrites the plist idempotently and bootouts any existing instance
     first so we never fight a stale PID.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     def _fail(msg, hint=None):
         # Under soft_fail we are inside a hook --
         # stdout is session-visible context, so route errors to stderr instead
@@ -26173,6 +26176,9 @@ def _uninstall_launchd_daemon(this_install_only=False, dry_run=False):
     side-effect-free (no bootout, no file deletion, no tombstone write) so the
     cleanup command's ``--dry-run`` is a true preview.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     if dry_run:
         # Dry-run: report what WOULD be removed, touch nothing.
         would_remove = []
@@ -26604,6 +26610,9 @@ def _install_task_scheduler_daemon(dry_run=False, soft_fail=False, effective_hos
     Windows user to run this is the de facto smoke test. Full rollback
     is one command: `measure.py setup-daemon --uninstall`.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     def _fail(msg, *extra, permanent_reason=None):
         # Only DEFINITIVE, permanent failure classes
         # arm the sticky no-retry marker (MS-Store alias, schtasks missing,
@@ -26807,6 +26816,9 @@ def _uninstall_task_scheduler_daemon(this_install_only=False, dry_run=False):
     side-effect-free (no schtasks calls, no file deletion, no tombstone write)
     so the cleanup command's ``--dry-run`` is a true preview.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     if dry_run:
         would_remove = []
         per_identity: list[tuple[Path, list[str]]] = []
@@ -27035,6 +27047,9 @@ def _install_systemd_user_daemon(dry_run=False, soft_fail=False, effective_host=
     and kill the calling Claude Code session. Returns True on success. CLI
     callers keep the default False for the hard-failure + actionable-hint UX.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     def _fail(msg, *extra):
         # Under soft_fail we are inside a hook --
         # stdout is session-visible context, so route errors to stderr instead
@@ -27205,6 +27220,9 @@ def _uninstall_systemd_user_daemon(this_install_only=False, dry_run=False):
     side-effect-free (no systemctl calls, no file deletion, no tombstone write)
     so the cleanup command's ``--dry-run`` is a true preview.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     if dry_run:
         would_remove = []
         per_identity: list[tuple[Path, list[str]]] = []

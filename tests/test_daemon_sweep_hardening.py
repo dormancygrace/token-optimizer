@@ -51,6 +51,22 @@ def measure(tmp_path, monkeypatch):
     base.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(mod.plugin_env, "_PLUGIN_DATA_BASE", base)
     monkeypatch.setattr(mod, "_all_plugin_data_dirs", mod.plugin_env._all_plugin_data_dirs)
+    launch_agents = tmp_path / "LaunchAgents"
+    launch_agents.mkdir()
+    monkeypatch.setattr(mod, "LAUNCH_AGENTS_DIR", launch_agents)
+    monkeypatch.setattr(
+        mod,
+        "PLIST_PATH",
+        launch_agents / "com.token-optimizer.dashboard.plist",
+    )
+    monkeypatch.setattr(
+        mod.subprocess,
+        "run",
+        lambda *a, **k: mod.subprocess.CompletedProcess(a, 1),
+    )
+    # The fixture exercises low-level sweep behavior, so bypass the production
+    # sandbox guard only after launchd paths and subprocesses are contained.
+    monkeypatch.setattr(mod, "_daemon_snapshot_sandboxed", lambda: False)
     yield mod, base
     sys.modules.pop("measure", None)
 
@@ -136,7 +152,7 @@ def test_launchd_boots_out_by_label_even_without_a_plist(measure, tmp_path, monk
     snap = base / "token-optimizer-a" / "data"
     _seed(snap)
     agents = tmp_path / "LaunchAgents"
-    agents.mkdir()
+    agents.mkdir(exist_ok=True)
     monkeypatch.setattr(mod, "LAUNCH_AGENTS_DIR", agents)  # no plist files at all
     monkeypatch.setattr(mod, "_reclaim_posix_daemon_port", lambda *a, **k: None)
     calls = []

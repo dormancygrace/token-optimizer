@@ -61,3 +61,26 @@ def test_direct_restart_is_blocked_before_subprocesses(measure, monkeypatch):
     monkeypatch.setattr(measure, "_reclaim_posix_daemon_port", _unexpected("port reclaim"))
     assert measure._restart_dashboard_daemon("Darwin") == "noop-sandbox"
     assert measure._daemon_resurrection_blocked() == "sandbox"
+
+
+@pytest.mark.parametrize(
+    "helper_name",
+    [
+        "_install_launchd_daemon",
+        "_uninstall_launchd_daemon",
+        "_install_task_scheduler_daemon",
+        "_uninstall_task_scheduler_daemon",
+        "_install_systemd_user_daemon",
+        "_uninstall_systemd_user_daemon",
+    ],
+)
+def test_low_level_os_helpers_stop_before_scheduler_or_identity_sweep(
+        measure, monkeypatch, helper_name):
+    monkeypatch.setattr(measure, "_daemon_identity_snapshot_dirs", _unexpected("identity sweep"))
+    monkeypatch.setattr(measure, "_scheduler_names_to_sweep", _unexpected("scheduler sweep"))
+    monkeypatch.setattr(measure, "_write_uninstall_tombstone", _unexpected("tombstone write"))
+    monkeypatch.setattr(measure, "_ensure_dashboard_file", _unexpected("dashboard write"))
+    monkeypatch.setattr(measure, "_systemd_user_unit_path", _unexpected("systemd path"))
+    monkeypatch.setattr(measure.subprocess, "run", _unexpected("scheduler subprocess"))
+
+    assert getattr(measure, helper_name)() is False
