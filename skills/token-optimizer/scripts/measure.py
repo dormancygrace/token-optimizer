@@ -9751,6 +9751,8 @@ def _parse_session_jsonl(filepath, window_start=None, window_end=None):
         cache_key = None  # stat failed — parse without caching
 
     if _use_codex_session_adapter(filepath):
+        if window_start is not None or window_end is not None:
+            return None  # This adapter does not yet support activity slicing.
         result = codex_session.parse_session_jsonl(filepath)
         if cache_key is not None:
             if len(_parse_session_jsonl_cache) >= _PARSE_CACHE_MAX:
@@ -18742,17 +18744,20 @@ def _get_savings_summary(days=30, since=None):
         }
 
 
-def _is_file_collected(conn, jsonl_path):
-    """Skip only unchanged sessions, including their delegated transcripts."""
+def _is_file_collected(conn, jsonl_path, check_mtime=False):
+    """Check stored IDs; file collectors also check delegated transcript changes."""
     row = conn.execute(
         "SELECT collected_at FROM session_log WHERE jsonl_path = ?",
         (str(jsonl_path),),
     ).fetchone()
     if row is None:
         return False
+    if not check_mtime:
+        return True  # Other adapters use synthetic IDs, not filesystem paths.
     try:
         collected = datetime.fromisoformat(row[0]).timestamp()
-        paths = [Path(jsonl_path), *_find_subagent_jsonl_files(jsonl_path)]
+        path = Path(jsonl_path)
+        paths = [path, *_find_subagent_jsonl_files(path)]
         return all(path.stat().st_mtime <= collected for path in paths)
     except (OSError, TypeError, ValueError):
         return False
@@ -20270,7 +20275,7 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
 
     # Capture the existing comparison before refreshing historical session rows.
     # The user's baseline must not move as collection catches up.
-    if not rebuild:
+    if not rebuild and not (SNAPSHOT_DIR / "workload_anchor.json").exists():
         _session_weight_pool_savings(
             (datetime.now() - timedelta(days=30)).date().isoformat())
 
@@ -20306,7 +20311,7 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
 
     new_count = 0
     for filepath, mtime, project_name in files:
-        if _is_file_collected(conn, filepath):
+        if _is_file_collected(conn, filepath, check_mtime=True):
             continue
 
         # Bounded per-run collection: never parse more than _COLLECT_MAX_PER_RUN new
@@ -20426,7 +20431,9 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
                reported_input_tokens=excluded.reported_input_tokens,
                reported_output_tokens=excluded.reported_output_tokens,
                reported_model_usage_json=excluded.reported_model_usage_json,
-               platform=excluded.platform""",
+               platform=excluded.platform
+               WHERE session_log.collected_at IS NULL
+                  OR excluded.collected_at >= session_log.collected_at""",
             (
                 str(filepath), date, project_name,
                 parsed["duration_minutes"],
@@ -42515,12 +42522,17 @@ def _stable_workload_anchor(before, month):
     try:
         if path.exists():
             frozen = json.loads(path.read_text(encoding="utf-8"))
-            metrics = frozen.get("metrics") or {}
-            if (frozen.get("month") == month
+            metrics = frozen.get("metrics") if isinstance(frozen, dict) else None
+            if (isinstance(metrics, dict) and frozen.get("month") == month
                     and frozen.get("rates") == _WEIGHT_POOL_FLAT_RATES
-                    and all(k in metrics for k in ("sessions", "usd", "tokens", "flat_usd", "api_calls", "messages"))):
+                    and all(isinstance(metrics.get(k), (int, float))
+                            and math.isfinite(metrics[k]) and metrics[k] >= 0
+                            for k in ("sessions", "usd", "tokens", "flat_usd", "api_calls", "messages"))
+                    and metrics["sessions"] >= _SESSION_WEIGHT_MIN_ANCHOR_SESSIONS
+                    and metrics["api_calls"] > 0 and metrics["flat_usd"] > 0):
                 return metrics
-            return None  # a changed/corrupt anchor needs review, not replacement
+            # Backfill/rebuild can change the earliest covered month. Re-anchor
+            # from the same shared population instead of permanently hiding it.
         if (before and before["sessions"] >= _SESSION_WEIGHT_MIN_ANCHOR_SESSIONS
                 and before["api_calls"] > 0 and before["flat_usd"] > 0):
             _write_baseline_state(path, {"month": month, "metrics": before,
@@ -42716,6 +42728,12 @@ def _price_parent_activity_window(conn, start, end, tier):
     paths = conn.execute(
         "SELECT jsonl_path, date FROM session_log WHERE input_tokens IS NOT NULL "
         "AND COALESCE(is_sidechain,0)=0").fetchall()
+    # Include new sessions before bounded collection reaches them.
+    known = {str(name) for name, _ in paths}
+    for path, mtime, _ in _find_all_jsonl_files(8):
+        if str(path) not in known:
+            paths.append((str(path), datetime.fromtimestamp(mtime).date().isoformat()))
+            known.add(str(path))
     rows = []
     for name, recorded_date in paths:
         path = Path(name)
@@ -42727,10 +42745,16 @@ def _price_parent_activity_window(conn, start, end, tier):
         if max(p.stat().st_mtime for p in [path, *children]) < start.timestamp():
             continue
         parsed = _parse_session_jsonl(path, window_start=start, window_end=end)
-        if not parsed or not parsed.get("api_calls"):
+        if parsed and parsed.get("is_sidechain"):
             continue
+        if not parsed:
+            parsed = {"total_input_tokens": 0, "total_output_tokens": 0,
+                      "total_cache_create_1h": 0, "total_cache_create_5m": 0,
+                      "cache_hit_rate": 0, "model_usage": {}, "api_calls": 0,
+                      "message_count": 0}
         inp, out = parsed["total_input_tokens"], parsed["total_output_tokens"]
         cw1, cw5 = parsed["total_cache_create_1h"], parsed["total_cache_create_5m"]
+        child_cache_read = 0
         for child in children:
             cp = _parse_session_jsonl(child, window_start=start, window_end=end)
             if cp:
@@ -42738,8 +42762,13 @@ def _price_parent_activity_window(conn, start, end, tier):
                 out += cp["total_output_tokens"]
                 cw1 += cp["total_cache_create_1h"]
                 cw5 += cp["total_cache_create_5m"]
+                child_cache_read += cp["total_cache_read"]
+        if not parsed["api_calls"] and inp + out == 0:
+            continue
         usage = json.dumps(parsed["model_usage"])
-        rows.append((inp, out, cw5, cw1, parsed["cache_hit_rate"], usage, usage,
+        hit = (parsed["cache_hit_rate"] if parsed["api_calls"] else
+               child_cache_read / inp if inp else 0)
+        rows.append((inp, out, cw5, cw1, hit, usage, usage,
                      parsed["api_calls"], parsed["message_count"]))
     return _price_parent_rows(rows, tier)
 
@@ -42756,20 +42785,44 @@ def _weekly_full_savings(resets_at=None, now=None):
         end = datetime.fromtimestamp(now if now is not None else time.time(), timezone.utc)
         start = (datetime.fromtimestamp(float(resets_at), timezone.utc) - timedelta(days=7)
                  if resets_at is not None else end - timedelta(days=7))
-        if start >= end or (resets_at is not None and end.timestamp() >= float(resets_at)):
+        if resets_at is None or start >= end or end.timestamp() >= float(resets_at):
             return None
+        # Dashboard refreshes may run several times per minute in separate
+        # processes. Keep an explicitly dated result for at most 60 seconds.
+        cache_path = SNAPSHOT_DIR / "weekly_full_value.json"
+        anchor_path = SNAPSHOT_DIR / "workload_anchor.json"
+        anchor_stamp = anchor_path.stat().st_mtime_ns if anchor_path.exists() else None
+        if now is None and cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                age = end.timestamp() - float(cached["computed_at"])
+                if (0 <= age < 60 and cached["start"] == start.isoformat()
+                        and cached["anchor_stamp"] == anchor_stamp
+                        and cached["version"] == TOKEN_OPTIMIZER_VERSION):
+                    return cached["value"]
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
         pool = _session_weight_pool_savings(
             start.isoformat(), days=7, activity_window=(start, end))
-        if not pool or pool["transformation_usd"] <= 0:
+        if not pool:
             return None
         # Same conservative display cap as the Savings tab.
-        saving = min(pool["transformation_usd"], pool["actual_usd"])
-        return {"saved_usd": round(saving, 2), "start": start.isoformat(),
+        saving = max(0.0, min(pool["transformation_usd"], pool["actual_usd"]))
+        value = {"saved_usd": round(saving, 2), "start": start.isoformat(),
                 "end": end.isoformat(), "method": "full workload",
                 "uncapped_usd": round(pool["transformation_usd"], 2),
                 "actual_usd": round(pool["actual_usd"], 2),
                 "counterfactual_usd": round(pool["counterfactual_usd"], 2),
                 "api_calls": pool["now_units"], "anchor_month": pool["anchor_month"]}
+        if now is None:
+            try:
+                _write_baseline_state(cache_path, {
+                    "computed_at": end.timestamp(), "start": start.isoformat(),
+                    "anchor_stamp": anchor_path.stat().st_mtime_ns if anchor_path.exists() else None,
+                    "version": TOKEN_OPTIMIZER_VERSION, "value": value})
+            except OSError:
+                pass
+        return value
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
         return None
 

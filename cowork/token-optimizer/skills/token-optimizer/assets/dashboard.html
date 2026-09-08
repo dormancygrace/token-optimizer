@@ -4083,6 +4083,16 @@ var DB = (function() {
           '</div>' +
         '</div>';
       }).join('');
+      // Savings remain available when the quota meter has no weekly reading.
+      var standaloneWeek = rw.weekly_full_value;
+      if (standaloneWeek && Number(standaloneWeek.saved_usd) >= 15 &&
+          !(rw.windows || []).some(function (w) { return w.key === 'seven_day'; })) {
+        rwCards += '<div style="padding:var(--s-3);border:1px solid var(--c-border);border-radius:8px;">' +
+          '<div class="label">Weekly savings</div><div style="font-size:22px;color:var(--c-savings-alt,#10b981);">&asymp;' +
+          rwMoney(standaloneWeek.saved_usd) + ' estimated savings so far this week</div>' +
+          '<p>Full workload estimate since ' + esc(new Date(standaloneWeek.start).toLocaleString()) +
+          '. Your weekly limit reading is unavailable.</p></div>';
+      }
       // USD-per-window headline: the dollar figure reuses the metered
       // savings ledger, apportioned to each window's span. Build the headline
       // from the windows that carry a saved_usd; fall back to the demoted
