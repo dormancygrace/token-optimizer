@@ -157,6 +157,15 @@ export interface RealizedSavings {
   compressionMeasuredWindowTokens: number;
   /** Estimated verbosity-steer $ before the baseline-output reprice. */
   verbosityMeasuredUsd: number;
+  /**
+   * RAW estimated verbosity-steer $ over the lookback window, BEFORE the
+   * 30/days monthly scaling that verbosityMeasuredUsd carries. The dashboard's
+   * action-savings card renders this as the period-total estimated figure
+   * (the actual selected-period savings_events sum), never a monthly run-rate.
+   * Same INVARIANT as compressionMeasuredWindowUsd: never summed into the
+   * transformation headline.
+   */
+  verbosityMeasuredWindowUsd: number;
   /** Repriced verbosity-steer $ (estimated output reduction at baseline mix). */
   verbosityTransformationUsd: number;
   savingsPerSession: number;
@@ -204,6 +213,7 @@ const NOT_READY = (status: string): RealizedSavings => ({
   compressionMeasuredWindowUsd: 0,
   compressionMeasuredWindowTokens: 0,
   verbosityMeasuredUsd: 0,
+  verbosityMeasuredWindowUsd: 0,
   verbosityTransformationUsd: 0,
   savingsPerSession: 0,
   beforeCostPerSession: 0,
@@ -527,6 +537,10 @@ export function computeRealizedSavings(
   // baseline output mix). Also a separate field for the dashboard, kept OUT of
   // the transformation headline.
   const verbosityMeasuredUsd = m(Math.max(0, measuredVerbosity));
+  // Raw window sum (pre-monthly-scale) for the action-savings card's period
+  // total. This is the actual selected-period savings_events sum, never a
+  // monthly run-rate or lifetime figure mislabeled as the lookback window.
+  const verbosityMeasuredWindowUsd = Math.max(0, measuredVerbosity);
 
   return {
     ready: true,
@@ -539,6 +553,7 @@ export function computeRealizedSavings(
     compressionMeasuredWindowUsd,
     compressionMeasuredWindowTokens: Math.max(0, measuredCompressionTokens),
     verbosityMeasuredUsd,
+    verbosityMeasuredWindowUsd,
     verbosityTransformationUsd: verbosityAddback,
     savingsPerSession: beforeCps - afterCps,
     beforeCostPerSession: beforeCps,

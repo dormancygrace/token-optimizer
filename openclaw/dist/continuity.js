@@ -301,7 +301,7 @@ function crossProjectFileDrop(p, cwd) {
 }
 /** True when the checkpoint carries at least one attributable absolute file
  *  path NOT under ``cwd`` — the checkpoint genuinely spans multiple projects
- *  (cross-project). DECISION filtering is gated on this: a single-project
+ *  (multi-project). DECISION filtering is gated on this: a single-project
  *  checkpoint (every attributable path in-project, or none) has nothing to
  *  scope, so its decisions are kept verbatim even when they name no project
  *  token (e.g. "Switched from REST polling to websocket push"). Without this

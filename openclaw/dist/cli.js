@@ -395,7 +395,7 @@ function cmdDashboard(days) {
     };
     // Open in default browser.
     //
-    // No-flash history, both wrong shapes:
+    // History, both wrong shapes:
     //  1. the opener was the bare string "start", but `start` is a cmd.exe
     //     BUILTIN -- there is no start.exe -- so execFile failed with ENOENT and
     //     the browser never opened (swallowed by the old noop callback);

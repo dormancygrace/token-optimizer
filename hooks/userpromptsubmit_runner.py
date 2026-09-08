@@ -190,7 +190,11 @@ def _read_hook_input() -> dict:
 def _harness_only_context() -> bool:
     """Require remote/container evidence or Codex, not an ambiguous harness tag."""
     container_id = os.environ.get("CLAUDE_CODE_CONTAINER_ID", "").strip()
-    remote = os.environ.get("CLAUDE_CODE_REMOTE", "").strip().lower() in {"1", "true"}
+    # Align with runtime_env._truthy_env, which accepts 1/true/yes/on
+    # (case-insensitive). false/0/off/empty stay False. Do NOT treat a generic
+    # AI_AGENT=claude-code_*_harness tag as harness evidence (Cowork is gated
+    # by detect_runtime() == "codex" below, not by the harness tag).
+    remote = os.environ.get("CLAUDE_CODE_REMOTE", "").strip().lower() in {"1", "true", "yes", "on"}
     if container_id or remote:
         return True
     for name in ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA"):

@@ -5,6 +5,14 @@ export interface TokenBreakdown {
     cacheWrite: number;
 }
 export declare function totalTokens(t: TokenBreakdown): number;
+/**
+ * Billable token basis = fresh_input + cache_create + output, EXCLUDING
+ * cache_read. Mirrors measure.py's `model_usage` (line 9019: `billable = u["inp"]
+ * + u["cc"] + u["out"]`), which is the canonical SPENT / model_mix basis.
+ * cache_read is a discounted reuse class, not a fresh billable unit, so it is
+ * excluded from the "what you spent" total to match the HTML dashboards.
+ */
+export declare function billableTokens(t: TokenBreakdown): number;
 export type RunType = "manual" | "heartbeat" | "cron";
 export type Outcome = "success" | "failure" | "empty" | "abandoned";
 export type Severity = "low" | "medium" | "high" | "critical";
