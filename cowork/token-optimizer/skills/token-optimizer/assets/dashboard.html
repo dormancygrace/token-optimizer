@@ -4011,7 +4011,7 @@ var DB = (function() {
     // unavailable meter used to vanish the whole card). runway_snapshot already
     // returns null when there is genuinely no story, so rw existing + a windows-
     // or-multiplier payload is the real render condition.
-    if (rw && (rwHasWindows || rwHasMultiplier)) {
+    if (rw && (rwHasWindows || rwHasMultiplier || rw.weekly_full_value)) {
       // Both sides are stated in the SAME unit (percent LEFT). An earlier revision
       // paired "89% left" against "16.6% used", which reads as a contradiction and
       // forces the reader to do the subtraction. The with/without pair is also the
@@ -4045,38 +4045,19 @@ var DB = (function() {
         // ledger has nothing to show; degrade to no line rather than $-0/NaN.
         var savedUsd = Number(w.saved_usd);
         var spanWord = w.key === 'five_hour' ? '5h' : 'week';
-        // Weekly $: shown whenever it is meaningful (>= $15) and NEVER gated on
-        // already being capped — at that size it is the overage you are on
-        // track to hit, not a hypothetical. Below $15 the line is noise: hide.
-        // The 5h window keeps the any-positive rule (its $ is already rare).
         var hasUsd = isFinite(savedUsd) && (w.key === 'five_hour' ? savedUsd > 0 : savedUsd >= 15);
-        // The per-window USD is the EXTRA you'd have paid in API credits to match
-        // this window's work WITHOUT Token Optimizer, priced over the window's OWN
-        // real span (the weekly card = the last 7 days, not a slice of a longer
-        // ledger). It is the API-equivalent savings delta, NOT total weekly cost
-        // and NOT strict post-cap overage; the explainer line + ESTIMATED $ chip
-        // carry that honesty. A big "$N more" number, a tiny "in API credits"
-        // caption, then a plain sentence that spells out the meaning.
-        // Honest per-window claim, conditional on whether the without-Optimizer arm
-        // would ACTUALLY have exceeded the cap this window. Capped => you'd have paid
-        // real overage (the value scenario). Not capped => the tokens removed have an
-        // API-rate value, but no bill was avoided; say so plainly (never claim overage
-        // that did not occur).
-        var usdExplainer = w.would_be_capped
-          ? ('Matching this ' + spanWord + '&rsquo;s work without Token Optimizer would have pushed you ' +
-             '<b style="color:var(--c-text-main);font-weight:500;">past your limit</b>. That&rsquo;s the extra you&rsquo;d have paid to do the same work.')
-          : (w.key === 'five_hour'
-             ? ('That&rsquo;s what this ' + spanWord + '&rsquo;s work would have cost you in API credits ' +
-                'without Token Optimizer &mdash; compute it kept off your plan. ' +
-                '<b style="color:var(--c-text-main);font-weight:500;">The harder you push your limits, ' +
-                'the more it saves you from paying to keep going.</b>')
-             : ('At this pace, doing this week&rsquo;s work without Token Optimizer ' +
-                '<b style="color:var(--c-text-main);font-weight:500;">would blow past your weekly limit</b> ' +
-                '&mdash; that&rsquo;s the API-credit overage you&rsquo;re on track to avoid.'));
+        var usdCaption = w.key === 'seven_day'
+          ? 'estimated savings so far this week' : 'of API-credit value kept off this 5h';
+        var usdExplainer = w.full_value
+          ? 'Estimated extra cost in API credits to do this week’s work without Token Optimizer. Includes the effects of lighter context, fewer repeat reads and your working habits, counted once.'
+          : 'API-equivalent value of the savings recorded in this window, including the available estimates.';
+        if (w.full_value && w.full_value.start) {
+          usdExplainer += ' Since ' + esc(new Date(w.full_value.start).toLocaleString([], {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'})) + '.';
+        }
         return '<div style="background:rgba(255,255,255,.02);border:1px solid var(--c-border);border-radius:8px;padding:var(--s-3);">' +
           '<div class="label" style="display:block;margin-bottom:var(--s-3);">' + name + '</div>' +
           (hasUsd
-            ? '<div style="margin-bottom:6px;font-size:22px;font-weight:500;color:var(--c-savings-alt, #10b981);line-height:1.2;">&asymp;' + rwMoney(savedUsd) + (w.would_be_capped ? ' more <span style="font-size:13px;color:var(--c-text-dim);font-weight:400;">in API credits</span>' : (w.key === 'five_hour' ? ' <span style="font-size:13px;color:var(--c-text-dim);font-weight:400;">of API-credit value kept off this ' + spanWord + '</span>' : ' <span style="font-size:13px;color:var(--c-text-dim);font-weight:400;">of overage you&rsquo;re on track to avoid this week</span>')) + '</div>' +
+            ? '<div style="margin-bottom:6px;font-size:22px;font-weight:500;color:var(--c-savings-alt, #10b981);line-height:1.2;">&asymp;' + rwMoney(savedUsd) + ' <span style="font-size:13px;color:var(--c-text-dim);font-weight:400;">' + usdCaption + '</span>' + '</div>' +
               '<div style="margin-bottom:var(--s-3);font-size:13px;color:var(--c-text-dim);line-height:1.5;text-wrap:pretty;">' + usdExplainer + '</div>'
             : '') +
           '<div style="display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:var(--s-3);">' +

@@ -9733,7 +9733,7 @@ def _osrc_prompt_text(record):
     return ""
 
 
-def _parse_session_jsonl(filepath):
+def _parse_session_jsonl(filepath, window_start=None, window_end=None):
     """Parse a single JSONL session file in one streaming pass.
 
     Returns a dict with extracted session metrics, or None if the file
@@ -9744,7 +9744,7 @@ def _parse_session_jsonl(filepath):
     # Memoization: skip re-parse if the file hasn't changed since we last saw it.
     try:
         st = os.stat(filepath)
-        cache_key = (str(filepath), st.st_mtime_ns, st.st_size)
+        cache_key = (str(filepath), st.st_mtime_ns, st.st_size, window_start, window_end)
         if cache_key in _parse_session_jsonl_cache:
             return _parse_session_jsonl_cache[cache_key]
     except OSError:
@@ -9840,6 +9840,21 @@ def _parse_session_jsonl(filepath):
                     s = record.get("slug")
                     if s:
                         slug = s
+
+                # Window reports must slice activity, including sessions that began
+                # before reset. Classify sidechains before filtering their records.
+                if window_start is not None or window_end is not None:
+                    try:
+                        activity_ts = datetime.fromisoformat(
+                            str(record.get("timestamp")).replace("Z", "+00:00"))
+                        if activity_ts.tzinfo is None:
+                            activity_ts = activity_ts.replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        continue
+                    if window_start is not None and activity_ts < window_start:
+                        continue
+                    if window_end is not None and activity_ts >= window_end:
+                        continue
 
                 # Extract timestamp
                 ts_str = record.get("timestamp")
@@ -18728,12 +18743,19 @@ def _get_savings_summary(days=30, since=None):
 
 
 def _is_file_collected(conn, jsonl_path):
-    """Check if a JSONL file has already been collected."""
-    cur = conn.execute(
-        "SELECT 1 FROM session_log WHERE jsonl_path = ?",
+    """Skip only unchanged sessions, including their delegated transcripts."""
+    row = conn.execute(
+        "SELECT collected_at FROM session_log WHERE jsonl_path = ?",
         (str(jsonl_path),),
-    )
-    return cur.fetchone() is not None
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        collected = datetime.fromisoformat(row[0]).timestamp()
+        paths = [Path(jsonl_path), *_find_subagent_jsonl_files(jsonl_path)]
+        return all(path.stat().st_mtime <= collected for path in paths)
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def _insert_normalized_session(conn, dedup_key, parsed, platform, project_fallback, quiet=False):
@@ -20225,7 +20247,7 @@ def _collect_antigravity_sessions(days=90, quiet=False, rebuild=False):
 def collect_sessions(days=90, quiet=False, rebuild=False):
     """Parse new JSONL files and insert into SQLite. Zero token cost.
 
-    Skips files already collected. Safe to run repeatedly.
+    Refreshes changed files in place. Safe to run repeatedly.
     With rebuild=True, drops and re-collects all data (e.g., after a
     measurement fix such as model attribution).
     """
@@ -20245,6 +20267,12 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
         return _collect_grok_sessions(days=days, quiet=quiet, rebuild=rebuild)
 
     conn = _init_trends_db()
+
+    # Capture the existing comparison before refreshing historical session rows.
+    # The user's baseline must not move as collection catches up.
+    if not rebuild:
+        _session_weight_pool_savings(
+            (datetime.now() - timedelta(days=30)).date().isoformat())
 
     # One-time migration for the model attribution fix: wipe model_daily (safe, fast, no data loss)
     if _needs_model_daily_rebuild(conn):
@@ -20288,7 +20316,9 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
         if _COLLECT_MAX_PER_RUN and not rebuild and new_count >= _COLLECT_MAX_PER_RUN:
             break
 
-        parsed = _parse_session_jsonl(filepath)
+        collection_started = datetime.now().isoformat()
+        # Rollups must not mutate the parser cache when only a child grows.
+        parsed = copy.deepcopy(_parse_session_jsonl(filepath))
         if not parsed:
             continue
 
@@ -20353,7 +20383,7 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
 
         # Insert session_log
         cur = conn.execute(
-            """INSERT OR IGNORE INTO session_log
+            """INSERT INTO session_log
                (jsonl_path, date, project, duration_minutes, input_tokens,
                 output_tokens, message_count, api_calls, cache_hit_rate,
                 cache_create_1h_tokens, cache_create_5m_tokens, cache_ttl_scanned,
@@ -20363,7 +20393,40 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
                     quality_score, quality_grade, stale_waste_tokens, is_sidechain,
                     sidechain_reason, reported_input_tokens, reported_output_tokens,
                     reported_model_usage_json, platform)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(jsonl_path) DO UPDATE SET
+               project=excluded.project,
+               duration_minutes=excluded.duration_minutes,
+               input_tokens=excluded.input_tokens,
+               output_tokens=excluded.output_tokens,
+               message_count=excluded.message_count,
+               api_calls=excluded.api_calls,
+               cache_hit_rate=excluded.cache_hit_rate,
+               cache_create_1h_tokens=excluded.cache_create_1h_tokens,
+               cache_create_5m_tokens=excluded.cache_create_5m_tokens,
+               cache_ttl_scanned=excluded.cache_ttl_scanned,
+               avg_call_gap_seconds=excluded.avg_call_gap_seconds,
+               max_call_gap_seconds=excluded.max_call_gap_seconds,
+               p95_call_gap_seconds=excluded.p95_call_gap_seconds,
+               skills_json=excluded.skills_json,
+               subagents_json=excluded.subagents_json,
+               tool_calls_json=excluded.tool_calls_json,
+               model_usage_json=excluded.model_usage_json,
+               all_model_usage_json=excluded.all_model_usage_json,
+               model_usage_breakdown_json=excluded.model_usage_breakdown_json,
+               version=excluded.version,
+               slug=excluded.slug,
+               topic=excluded.topic,
+               collected_at=excluded.collected_at,
+               quality_score=excluded.quality_score,
+               quality_grade=excluded.quality_grade,
+               stale_waste_tokens=excluded.stale_waste_tokens,
+               is_sidechain=excluded.is_sidechain,
+               sidechain_reason=excluded.sidechain_reason,
+               reported_input_tokens=excluded.reported_input_tokens,
+               reported_output_tokens=excluded.reported_output_tokens,
+               reported_model_usage_json=excluded.reported_model_usage_json,
+               platform=excluded.platform""",
             (
                 str(filepath), date, project_name,
                 parsed["duration_minutes"],
@@ -20387,7 +20450,7 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
                 parsed["version"],
                 parsed.get("slug"),
                 parsed.get("topic"),
-                datetime.now().isoformat(),
+                collection_started,
                 sq["score"],
                 sq["grade"],
                 int(stale_waste or 0),
@@ -39647,6 +39710,9 @@ def runway_snapshot(days=30, now=None):
         meter_available = bool(meters.get("available"))
         meter_stale = bool(meters.get("stale")) or not meter_available
 
+        weekly_full = _weekly_full_savings(
+            resets_at=meters.get("seven_day_resets_at"), now=now)
+
         # --- context lever: measured, never estimated ---
         consumed = saved = 0
         spent_basis = None
@@ -39668,19 +39734,21 @@ def runway_snapshot(days=30, now=None):
                 conn.close()
         except Exception:
             return None
-        if consumed <= 0:
+        if consumed <= 0 and not weekly_full:
             return None
-        context_mult = (consumed + saved) / consumed
+        context_mult = (consumed + saved) / consumed if consumed > 0 else 1.0
 
         # --- routing lever: this user's own shift, priced by input rates ---
         routing_mult = _input_rate_mix_ratio(days=days)
         if routing_mult is None or routing_mult <= 0:
-            return None
+            if not weekly_full:
+                return None
+            routing_mult = 1.0
 
         mult = context_mult * routing_mult
         # Below ~1.02 there is no story worth telling and rounding noise would
         # dominate; say nothing rather than dress up a rounding artefact.
-        if mult < 1.02:
+        if mult < 1.02 and not weekly_full:
             return None
 
         # --- USD-per-window: API-credit OVERAGE over each window's OWN real span ---
@@ -39758,7 +39826,7 @@ def runway_snapshot(days=30, now=None):
                     # -- real, magnitude-metered (v5.13.1) savings that were simply
                     # unlabelled. Window-scoped already (days/since passed above).
                     _rl = wm.get("resume_lean_estimated") or {}
-                    _vs = wm.get("verbosity_steer_estimated") or {}
+                    _vs = wm.get("verbosity_steer") or wm.get("verbosity_steer_estimated") or {}
                     est_add = float(_rl.get("cost_saved_usd", 0.0) or 0.0) \
                         + float(_vs.get("cost_saved_usd", 0.0) or 0.0)
                 except Exception:
@@ -39790,6 +39858,9 @@ def runway_snapshot(days=30, now=None):
                 # trigger is counterfactual even though the magnitude is metered.
                 ctx += est_add
                 est_added = est_add > 0.0
+                if wdays == 7 and weekly_full:
+                    ctx, rt = weekly_full["saved_usd"], 0.0
+                    est_added = True
                 _overage_cache[cache_key] = (ctx, rt, repriced, counted_window, est_added)
             ctx, rt, repriced, counted_window, est_added = _overage_cache[cache_key]
             total = ctx + rt
@@ -39847,6 +39918,7 @@ def runway_snapshot(days=30, now=None):
                 "would_be_capped": head_cf <= 0.5,
                 "saved_usd": window_saved_usd,
                 "saved_usd_tier": window_usd_tier,
+                "full_value": weekly_full if key == "seven_day" else None,
             })
         # REGRESSION FIX (the "Your plan goes further" card vanished after a quiet
         # week): the per-window guard above drops the 5h window once the meter is
@@ -39919,7 +39991,9 @@ def runway_snapshot(days=30, now=None):
             "saved_usd_context": round(saved_context_usd, 2),
             "saved_usd_routing": round(saved_routing_usd, 2),
             "saved_usd_tier": saved_usd_tier,
+            "weekly_full_value": weekly_full,
             "window_savings_basis": (
+                "full workload, exact subscription week" if weekly_full else
                 "counted transcript window" if _wk_counted else "flat savings ledger fallback"),
             # period_days scopes the throughput MULTIPLIERS (context/routing), not
             # the per-window dollars: each window now prices overage over its OWN
@@ -39938,13 +40012,17 @@ def runway_snapshot(days=30, now=None):
             # longer repeats it. Keep the phrases "metered savings ledger" and "not
             # derived from the throughput multipliers" -- guarded by
             # test_proxy_disclosure_mentions_ledger_reuse.
-            "proxy": ("Your window usage is measured; the “without” "
+            "proxy": ("Weekly dollars use the Savings tab's full workload estimate for activity "
+                      "since the subscription reset, at constant prices. Measured and estimated "
+                      "effects overlap, so they are counted once. This is accrued API-equivalent "
+                      "value, not a forecast or an overage bill. The headline percentage covers "
+                      "30 days; window comparisons are estimates." if weekly_full else ("Your window usage is measured; the “without” "
                       "comparison and routing dollars are estimated (the provider "
                       "does not publish how it weights models inside a window, so "
                       "public input-rate ratios stand in). Per-window dollars reuse "
                       "the metered savings ledger (context tokens never sent, priced "
                       "at input rates, plus a routing estimate) and are not derived "
-                      "from the throughput multipliers."),
+                      "from the throughput multipliers.")),
         }
     except Exception:
         return None
@@ -42389,6 +42467,10 @@ def _price_parent_window(conn, where, params, tier):
         "FROM session_log WHERE input_tokens IS NOT NULL "
         "AND COALESCE(is_sidechain, 0) = 0 " + where, params
     ).fetchall()
+    return _price_parent_rows(rows, tier)
+
+
+def _price_parent_rows(rows, tier):
     if not rows:
         return None
     default_model = _default_model_for_runtime()
@@ -42427,7 +42509,29 @@ def _price_parent_window(conn, where, params, tier):
             "flat_usd": flat_usd, "api_calls": api_calls, "messages": messages}
 
 
-def _session_weight_pool_savings(cutoff, days=30, tier=None):
+def _stable_workload_anchor(before, month):
+    """Keep the existing workload comparison stable during session refreshes."""
+    path = SNAPSHOT_DIR / "workload_anchor.json"
+    try:
+        if path.exists():
+            frozen = json.loads(path.read_text(encoding="utf-8"))
+            metrics = frozen.get("metrics") or {}
+            if (frozen.get("month") == month
+                    and frozen.get("rates") == _WEIGHT_POOL_FLAT_RATES
+                    and all(k in metrics for k in ("sessions", "usd", "tokens", "flat_usd", "api_calls", "messages"))):
+                return metrics
+            return None  # a changed/corrupt anchor needs review, not replacement
+        if (before and before["sessions"] >= _SESSION_WEIGHT_MIN_ANCHOR_SESSIONS
+                and before["api_calls"] > 0 and before["flat_usd"] > 0):
+            _write_baseline_state(path, {"month": month, "metrics": before,
+                                        "rates": _WEIGHT_POOL_FLAT_RATES,
+                                        "captured_at": datetime.now().isoformat()})
+        return before
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _session_weight_pool_savings(cutoff, days=30, tier=None, activity_window=None):
     """THE volume lever: cost per UNIT OF WORK, over the whole parent population.
 
     The frozen-anchor pool holds session volume constant across both arms by
@@ -42493,7 +42597,10 @@ def _session_weight_pool_savings(cutoff, days=30, tier=None):
                 return None
             before = _price_parent_window(
                 conn, "AND date LIKE ?", (anchor_month + "%",), tier)
-            now = _price_parent_window(conn, "AND date >= ?", (cutoff,), tier)
+            before = _stable_workload_anchor(before, anchor_month)
+            now = (_price_parent_activity_window(conn, *activity_window, tier)
+                   if activity_window else
+                   _price_parent_window(conn, "AND date >= ?", (cutoff,), tier))
         finally:
             conn.close()
         if not before or not now:
@@ -42596,6 +42703,74 @@ def _session_weight_pool_savings(cutoff, days=30, tier=None):
             "capacity_assumption": capacity_note,
         }
     except (sqlite3.Error, OSError, ValueError, TypeError, ZeroDivisionError):
+        return None
+
+
+def _price_parent_activity_window(conn, start, end, tier):
+    """Use real in-window activity with the standard parent/child pricing rules.
+
+    Reading transcripts here also keeps a weekly report correct while bounded
+    background collection catches up. Missing files produce an unavailable
+    estimate instead of silently treating missing work as zero cost.
+    """
+    paths = conn.execute(
+        "SELECT jsonl_path, date FROM session_log WHERE input_tokens IS NOT NULL "
+        "AND COALESCE(is_sidechain,0)=0").fetchall()
+    rows = []
+    for name, recorded_date in paths:
+        path = Path(name)
+        if not path.exists():
+            if str(recorded_date) < start.date().isoformat():
+                continue
+            return None
+        children = _find_subagent_jsonl_files(path)
+        if max(p.stat().st_mtime for p in [path, *children]) < start.timestamp():
+            continue
+        parsed = _parse_session_jsonl(path, window_start=start, window_end=end)
+        if not parsed or not parsed.get("api_calls"):
+            continue
+        inp, out = parsed["total_input_tokens"], parsed["total_output_tokens"]
+        cw1, cw5 = parsed["total_cache_create_1h"], parsed["total_cache_create_5m"]
+        for child in children:
+            cp = _parse_session_jsonl(child, window_start=start, window_end=end)
+            if cp:
+                inp += cp["total_input_tokens"]
+                out += cp["total_output_tokens"]
+                cw1 += cp["total_cache_create_1h"]
+                cw5 += cp["total_cache_create_5m"]
+        usage = json.dumps(parsed["model_usage"])
+        rows.append((inp, out, cw5, cw1, parsed["cache_hit_rate"], usage, usage,
+                     parsed["api_calls"], parsed["message_count"]))
+    return _price_parent_rows(rows, tier)
+
+
+def _weekly_full_savings(resets_at=None, now=None):
+    """The Savings tab's full estimate, accrued inside this subscription week.
+
+    Its before/after difference already includes overlapping measured and
+    estimated mechanisms. Never add their individual estimates on top.
+    """
+    if detect_runtime() != "claude":
+        return None
+    try:
+        end = datetime.fromtimestamp(now if now is not None else time.time(), timezone.utc)
+        start = (datetime.fromtimestamp(float(resets_at), timezone.utc) - timedelta(days=7)
+                 if resets_at is not None else end - timedelta(days=7))
+        if start >= end or (resets_at is not None and end.timestamp() >= float(resets_at)):
+            return None
+        pool = _session_weight_pool_savings(
+            start.isoformat(), days=7, activity_window=(start, end))
+        if not pool or pool["transformation_usd"] <= 0:
+            return None
+        # Same conservative display cap as the Savings tab.
+        saving = min(pool["transformation_usd"], pool["actual_usd"])
+        return {"saved_usd": round(saving, 2), "start": start.isoformat(),
+                "end": end.isoformat(), "method": "full workload",
+                "uncapped_usd": round(pool["transformation_usd"], 2),
+                "actual_usd": round(pool["actual_usd"], 2),
+                "counterfactual_usd": round(pool["counterfactual_usd"], 2),
+                "api_calls": pool["now_units"], "anchor_month": pool["anchor_month"]}
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
         return None
 
 
