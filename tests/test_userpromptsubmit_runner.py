@@ -62,6 +62,36 @@ def _load_runner(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.parametrize("runtime,cowork", [("claude", True), ("codex", False)])
+@pytest.mark.parametrize("event", [None, "UserPromptSubmit"])
+def test_compact_restore_envelope_matches_prompt_hook(monkeypatch, tmp_path, capsys, runtime, cowork, event):
+    runner = _load_runner(monkeypatch, tmp_path)
+    monkeypatch.setattr(runner.measure, "_ran_once_this_session", lambda *a: False)
+    monkeypatch.setattr(runner, "_runner_budget", lambda *a: 8)
+    monkeypatch.setattr(runner.measure, "is_cowork", lambda: cowork)
+    monkeypatch.setattr(runner.measure, "detect_runtime", lambda: runtime)
+    monkeypatch.setattr(runner.measure, "compact_restore", lambda **kw: print("remember this"))
+    payload = {"session_id": "prompt-event-test"}
+    if event:
+        payload["hook_event_name"] = event
+    runner._sub_compact_restore(payload)
+    import json
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "remember this" in output["hookSpecificOutput"]["additionalContext"]
+
+
+@pytest.mark.parametrize("runtime,expected", [("claude", False), ("codex", True)])
+def test_native_harness_tag_does_not_enable_cowork_tasks(monkeypatch, tmp_path, runtime, expected):
+    runner = _load_runner(monkeypatch, tmp_path)
+    for name in ("CLAUDE_CODE_CONTAINER_ID", "CLAUDE_CODE_REMOTE", "CLAUDE_PLUGIN_DATA"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AI_AGENT", "claude-code_2.1.258_harness")
+    monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path / "local-harness-project"))
+    monkeypatch.setattr(runner.measure, "detect_runtime", lambda: runtime)
+    assert runner._harness_only_context() is expected
+
+
 def test_userpromptsubmit_env_opt_out_returns_before_spawning_child(monkeypatch):
     run = _load_run_py()
     monkeypatch.setattr(sys, "argv", ["run.py", "hooks/userpromptsubmit_runner.py"])

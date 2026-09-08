@@ -8,6 +8,7 @@ and ``--password-file`` carry no value, and a bare ``-p`` means "prompt me".
 """
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 
@@ -86,11 +87,24 @@ def test_redaction_is_idempotent_on_quoted_values():
 def test_nudge_label_never_carries_the_secret(monkeypatch, tmp_path):
     monkeypatch.setenv("TOKEN_OPTIMIZER_SNAPSHOT_DIR", str(tmp_path))
     monkeypatch.setenv("CLAUDE_SESSION_ID", "label-redaction-test")
-    import thrash_guard
-    cmd = 'psql --password="s3 cret" -h db'
-    nudge = None
-    for _ in range(thrash_guard.STREAK_THRESHOLD):
-        nudge = thrash_guard.check(cmd, "FATAL: password authentication failed", now=1000.0)
-    assert nudge is not None
-    assert "s3 cret" not in nudge
-    assert "REDACTED" in nudge
+    names = ("plugin_env", "session_store", "thrash_guard")
+    saved = {name: sys.modules.get(name) for name in names}
+    try:
+        for name in names:
+            sys.modules.pop(name, None)
+        thrash_guard = importlib.import_module("thrash_guard")
+        cmd = 'psql --password="s3 cret" -h db'
+        nudge = None
+        for _ in range(thrash_guard.STREAK_THRESHOLD):
+            nudge = thrash_guard.check(
+                cmd, "FATAL: password authentication failed", now=1000.0
+            )
+        assert nudge is not None
+        assert "s3 cret" not in nudge
+        assert "REDACTED" in nudge
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module

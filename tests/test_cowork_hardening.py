@@ -100,6 +100,75 @@ def test_is_cowork_undocumented_fallback_still_holds(monkeypatch):
     assert runtime_env.is_cowork() is True
 
 
+def test_is_cowork_synced_plugin_root_still_triggers(monkeypatch):
+    # Genuine Cowork signal: org-console account-synced plugins land under
+    # /plugins/synced/. This path is Cowork-specific and must still trigger.
+    _reset_cowork_env(monkeypatch)
+    monkeypatch.setenv(
+        "CLAUDE_PLUGIN_ROOT",
+        "/root/.claude/plugins/synced/acct/token-optimizer",
+    )
+    _cache_clear(runtime_env.is_cowork)
+    assert runtime_env.is_cowork() is True
+
+
+def test_is_cowork_synced_plugin_data_still_triggers(monkeypatch):
+    # CLAUDE_PLUGIN_DATA under /plugins/synced/ is the same genuine signal.
+    _reset_cowork_env(monkeypatch)
+    monkeypatch.setenv(
+        "CLAUDE_PLUGIN_DATA",
+        "/root/.claude/plugins/synced/acct/token-optimizer/data",
+    )
+    _cache_clear(runtime_env.is_cowork)
+    assert runtime_env.is_cowork() is True
+
+
+@pytest.mark.parametrize(
+    "ai_agent",
+    [
+        # Native Claude Code CLI exports this exact shape into every hook
+        # subprocess (observed on 2.1.258). The "_harness" suffix is NOT a
+        # Cowork-only marker.
+        "claude-code_2.1.258_harness",
+        # Older observed Cowork value that the local CLI now also emits.
+        "claude-code_2-1-231_harness",
+        # Bare harness without the claude-code prefix must not match either.
+        "harness",
+        # The local CLI's "_agent" variant was never a match; keep it false.
+        "claude-code_2-1-229_agent",
+    ],
+)
+def test_is_cowork_native_ai_agent_harness_is_not_cowork(monkeypatch, ai_agent):
+    """Regression: native Claude Code sets AI_AGENT=claude-code_<ver>_harness.
+
+    Before the fix, is_cowork() matched ``claude-code`` + ``harness`` substrings
+    in AI_AGENT and returned True on every native hook fire. Native Claude Code
+    (local CLI) exports the SAME ``_harness`` suffix as Cowork, so AI_AGENT is
+    ambiguous and must NOT contribute a Cowork signal. This test pins the fix:
+    AI_AGENT alone never triggers is_cowork(), regardless of its value.
+    """
+    _reset_cowork_env(monkeypatch)
+    monkeypatch.setenv("AI_AGENT", ai_agent)
+    _cache_clear(runtime_env.is_cowork)
+    assert runtime_env.is_cowork() is False, (
+        f"AI_AGENT={ai_agent!r} must not trigger is_cowork() (native CLI also sets it)"
+    )
+
+
+def test_is_cowork_native_ai_agent_does_not_shadow_real_remote(monkeypatch):
+    """AI_AGENT being set must not prevent a genuine CLAUDE_CODE_REMOTE signal.
+
+    The removal of the AI_AGENT check must not break the positive path: when a
+    real Cowork marker (CLAUDE_CODE_REMOTE) is present alongside the native
+    AI_AGENT harness value, is_cowork() still returns True.
+    """
+    _reset_cowork_env(monkeypatch)
+    monkeypatch.setenv("AI_AGENT", "claude-code_2.1.258_harness")
+    monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+    _cache_clear(runtime_env.is_cowork)
+    assert runtime_env.is_cowork() is True
+
+
 # --------------------------------------------------------------------------- #
 # documented additionalContext envelope emitter
 # --------------------------------------------------------------------------- #

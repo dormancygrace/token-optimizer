@@ -4055,9 +4055,9 @@ var DB = (function() {
         var spanWord = w.key === 'five_hour' ? '5h' : 'week';
         var hasUsd = isFinite(savedUsd) && (w.key === 'five_hour' ? savedUsd > 0 : savedUsd >= 15);
         var usdCaption = w.key === 'seven_day'
-          ? 'estimated savings so far this week' : 'of API-credit value kept off this 5h';
+          ? 'in API-equivalent savings this week' : 'in API-equivalent savings this 5h';
         var usdExplainer = w.full_value
-          ? 'Estimated extra cost in API credits to do this week’s work without Token Optimizer. Includes the effects of lighter context, fewer repeat reads and your working habits, counted once.'
+          ? 'Estimated additional cost at API prices for the same work without Token Optimizer. Includes lighter context, fewer repeat reads and working habits, counted once. Your plan may cover some or all of that usage.'
           : 'API-equivalent value of the savings recorded in this window, including the available estimates.';
         if (w.full_value && w.full_value.start) {
           usdExplainer += ' Since ' + esc(new Date(w.full_value.start).toLocaleString([], {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'})) + '.';
@@ -4066,7 +4066,7 @@ var DB = (function() {
           '<div class="label" style="display:block;margin-bottom:var(--s-3);">' + name + '</div>' +
           (hasUsd
             ? '<div style="margin-bottom:6px;font-size:22px;font-weight:500;color:var(--c-savings-alt, #10b981);line-height:1.2;">&asymp;' + rwMoney(savedUsd) + ' <span style="font-size:13px;color:var(--c-text-dim);font-weight:400;">' + usdCaption + '</span>' + '</div>' +
-              '<div style="margin-bottom:var(--s-3);font-size:13px;color:var(--c-text-dim);line-height:1.5;text-wrap:pretty;">' + usdExplainer + '</div>'
+              '<details style="margin-bottom:var(--s-3);font-size:13px;color:var(--c-text-dim);line-height:1.5;text-wrap:pretty;"><summary style="cursor:pointer;">How this is estimated</summary><div>' + usdExplainer + '</div></details>'
             : '') +
           '<div style="display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:var(--s-3);">' +
             '<div>' +
@@ -4097,7 +4097,7 @@ var DB = (function() {
           !(rw.windows || []).some(function (w) { return w.key === 'seven_day'; })) {
         rwCards += '<div style="padding:var(--s-3);border:1px solid var(--c-border);border-radius:8px;">' +
           '<div class="label">Weekly savings</div><div style="font-size:22px;color:var(--c-savings-alt,#10b981);">&asymp;' +
-          rwMoney(standaloneWeek.saved_usd) + ' estimated savings so far this week</div>' +
+          rwMoney(standaloneWeek.saved_usd) + ' in API-equivalent savings this week</div>' +
           '<p>Full workload estimate since ' + esc(new Date(standaloneWeek.start).toLocaleString()) +
           '. Your weekly limit reading is unavailable.</p></div>';
       }

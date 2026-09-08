@@ -163,6 +163,7 @@ def test_systemd_diagnostic_routed_to_log_not_streams(monkeypatch, tmp_path):
     # _install_systemd_user_daemon(soft_fail=True) writes to sys.stderr when
     # _probe_systemd_user_bus returns False.
     monkeypatch.setattr(runner.measure, "_probe_systemd_user_bus", lambda: False)
+    monkeypatch.setattr(runner.measure, "_daemon_snapshot_sandboxed", lambda: False)
 
     def _fake_ensure_health():
         runner.measure._install_systemd_user_daemon(soft_fail=True)
@@ -195,6 +196,7 @@ def test_launchd_diagnostic_routed_to_log_not_streams(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner.measure, "_ensure_dashboard_file",
                         lambda **kw: False)
+    monkeypatch.setattr(runner.measure, "_daemon_snapshot_sandboxed", lambda: False)
 
     def _fake_ensure_health():
         runner.measure._install_launchd_daemon(soft_fail=True)
@@ -386,6 +388,7 @@ def test_integration_systemd_less_box_routes_diagnostics_to_log(
 
     # Simulated systemd-less box.
     monkeypatch.setattr(runner.measure, "_probe_systemd_user_bus", lambda: False)
+    monkeypatch.setattr(runner.measure, "_daemon_snapshot_sandboxed", lambda: False)
     # Dashboard missing: point DASHBOARD_PATH at a nonexistent file.
     monkeypatch.setattr(runner.measure, "DASHBOARD_PATH",
                         tmp_path / "nope" / "dashboard.html")
@@ -454,6 +457,7 @@ def test_systemd_error_still_prints_to_stdout_for_interactive_cli(m, monkeypatch
     (soft_fail=False) must still see the actionable error on stdout -- we only
     suppress the injected-context path, never genuine interactive diagnostics."""
     monkeypatch.setattr(m, "_probe_systemd_user_bus", lambda: False)
+    monkeypatch.setattr(m, "_daemon_snapshot_sandboxed", lambda: False)
 
     with pytest.raises(SystemExit):
         m._install_systemd_user_daemon(soft_fail=False)
