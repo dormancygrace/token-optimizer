@@ -4370,8 +4370,10 @@ var DB = (function() {
       var wpUnit = (wp && wp.work_unit === 'message') ? 'message' : 'API call';
       var oldCost = Number(ba.counterfactual_monthly_usd) || 0;
       var nowCost = Number(ba.actual_monthly_usd) || 0;
-      // The percentage uses the same cost comparison as the dollar headline.
-      var costCut = oldCost > 0 ? Math.max(0, (1 - nowCost / oldCost) * 100) : 0;
+      // Use the displayed saving so a spend-capped headline cannot retain the
+      // larger, uncapped percentage implied by the counterfactual arms.
+      var shownSaving = Number(ba.monthly_savings_usd) || 0;
+      var costCut = oldCost > 0 ? Math.max(0, shownSaving / oldCost * 100) : 0;
       html += '<div class="card wide savings-transformation" style="padding:var(--s-4);margin-bottom:var(--s-3);">' +
         '<div class="label">Transformation &middot; last ' + days + ' days &middot; estimated</div>' +
         '<div class="savings-amount">' + money(ba.monthly_savings_usd) +
@@ -4380,6 +4382,9 @@ var DB = (function() {
         '<div class="savings-split"><span>Now <strong>' + money(nowCost) + '</strong></span>' +
           '<span>Earlier workflow <strong>' + money(oldCost) + '</strong></span></div>' +
         '<div class="note">Overlaps with the action savings below. Do not add the two totals.</div>' +
+        (ba.savings_capped && ba.savings_cap_note
+          ? '<div class="note" style="margin-top:var(--s-2);">' + esc(ba.savings_cap_note) + '</div>'
+          : '') +
         fold('How this is estimated',
           (wp
             ? '<p>Baseline: <strong>' + esc(wp.anchor_month) + '</strong>. We compare cost per ' + wpUnit +

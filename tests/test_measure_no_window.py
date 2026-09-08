@@ -340,6 +340,8 @@ def m(monkeypatch):
         del sys.modules["measure"]
     mod = importlib.import_module("measure")
     importlib.reload(mod)
+    # This module replaces daemon OS actions before invoking lifecycle code.
+    monkeypatch.setattr(mod, "_daemon_snapshot_sandboxed", lambda: False)
     monkeypatch.setattr(mod, "_is_foreign_runtime", lambda: False)
     monkeypatch.setattr(mod, "detect_runtime", lambda: "claude")
     # The legacy daemon dir derives from RUNTIME_DIR (the REAL ~/.claude, not
@@ -1020,6 +1022,7 @@ def test_marker_survives_a_fresh_session(m, monkeypatch):
     _arm_marker(m)
     marker_path = m.DAEMON_INSTALL_FAILED_BREADCRUMB
     reloaded = importlib.reload(m)
+    monkeypatch.setattr(reloaded, "_daemon_snapshot_sandboxed", lambda: False)
     monkeypatch.setattr(reloaded, "_is_foreign_runtime", lambda: False)
     monkeypatch.setattr(reloaded, "detect_runtime", lambda: "claude")
     monkeypatch.setattr(reloaded, "_read_config_flag", lambda k, d=None: False)

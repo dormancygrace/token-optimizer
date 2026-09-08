@@ -401,3 +401,19 @@ def test_transcript_rotation_preserves_previously_verified_history(m, tmp_path, 
         conn.commit()
         assert m._purge_counted_without_transcripts(conn) == 1
         assert conn.execute('SELECT event_key,oneshot_usd,reread_usd FROM counted_reread').fetchall() == [('verified', 5, 50)]
+
+
+def test_transcript_rotation_preserves_marker_backfill_history(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    monkeypatch.setattr(m, '_counted_session_path', lambda *a: None)
+    with sqlite3.connect(str(dbp)) as conn:
+        conn.execute(
+            "INSERT INTO counted_reread(event_key,source,session_uuid,oneshot_usd,"
+            "reread_usd,transcript_mtime) VALUES('mk:old:0','mk',?,?,?,NULL)",
+            (SID, 5, 50),
+        )
+        conn.commit()
+        assert m._purge_counted_without_transcripts(conn) == 0
+        assert conn.execute(
+            'SELECT event_key,oneshot_usd,reread_usd FROM counted_reread'
+        ).fetchall() == [('mk:old:0', 5, 50)]

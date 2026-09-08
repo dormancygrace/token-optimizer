@@ -438,6 +438,17 @@ else:
     SNAPSHOT_DIR = RUNTIME_DIR / "_backups" / "token-optimizer"
     _CONFIG_BASE = None  # resolved below after constants
 
+
+def _daemon_snapshot_sandboxed():
+    """True when session data was explicitly redirected for tests/sandboxes.
+
+    A sandbox snapshot must never mutate the machine-wide daemon identity.
+    The value is frozen with SNAPSHOT_DIR at import so later environment drift
+    cannot separate the guard from the paths it protects.
+    """
+    return bool(_SNAPSHOT_DIR_OVERRIDE)
+
+
 # Cowork dual-write: the per-session state dirs -- QUALITY_CACHE_DIR
 # (quality-cache-*.json, resumable-*.json, run-once markers) and CHECKPOINT_DIR
 # -- default to RUNTIME_DIR (~/.claude/token-optimizer). But SNAPSHOT_DIR
@@ -18431,7 +18442,7 @@ def _purge_counted_without_transcripts(conn):
     try:
         rows = conn.execute(
             "SELECT rowid, session_uuid FROM counted_reread "
-            "WHERE transcript_mtime IS NULL"
+            "WHERE transcript_mtime IS NULL AND COALESCE(source, '') <> 'mk'"
         ).fetchall()
     except sqlite3.Error:
         return 0
@@ -27324,6 +27335,8 @@ def setup_daemon(dry_run=False, uninstall=False, this_install_only=False, latch_
     clean only the resolved identity, for a user intentionally running
     side-by-side installs who only wants this one gone.
     """
+    if _daemon_snapshot_sandboxed():
+        return "noop-sandbox"
     system = _normalized_platform()
     if uninstall:
         if system == "Darwin":
@@ -27792,6 +27805,10 @@ def _ensure_dashboard_daemon(force=False):
     ('restart-stale' propagates up from _restart_dashboard_daemon's
     landing-verification.) Never raises.
     """
+    # An explicit snapshot override is an isolation boundary, including when a
+    # detached daemon-revive child calls this with force=True.
+    if _daemon_snapshot_sandboxed():
+        return "noop-sandbox"
     # Cheapest gates first -- all pure/stat, no subprocess.
     if _is_foreign_runtime() or detect_runtime() != "claude":
         return "noop-foreign"
@@ -27980,6 +27997,8 @@ def _daemon_midsession_pulse():
     installer. Returns a short status string. Never raises, never blocks.
     """
     try:
+        if _daemon_snapshot_sandboxed():
+            return "noop-sandbox"
         # SAFETY gates run EVERY turn, BEFORE the probe throttle: a
         # disabled/uninstalled/thrashing daemon must NEVER be revived, not even on
         # the 59/60 throttled turns. All are cheap (a stat + a small config read +
@@ -28222,11 +28241,13 @@ def _daemon_resurrection_blocked():
     the user turned off. One helper, checked by every path that could
     (re)start a daemon, so no future call site can bypass a gate by accident.
 
-    Returns the blocking reason (``"tombstoned"`` | ``"disabled"`` |
-    ``"install-failed"``) or None when the action may proceed. The tombstone
+    Returns the blocking reason (``"sandbox"`` | ``"tombstoned"`` |
+    ``"disabled"`` | ``"install-failed"``) or None when the action may proceed. The tombstone
     stat fails open (matching ``_daemon_install_failed_marker_present``: an
     unreadable state dir is not evidence of intent). Never raises.
     """
+    if _daemon_snapshot_sandboxed():
+        return "sandbox"
     try:
         if os.path.exists(str(DAEMON_THRASH_BREADCRUMB)):
             return "tombstoned"
@@ -28526,6 +28547,8 @@ def _restart_dashboard_daemon(system):
     would SIGTERM session A's freshly-bound correct daemon, causing a restart
     flap. Checking the served version first makes the whole restart idempotent.
     """
+    if _daemon_snapshot_sandboxed():
+        return "noop-sandbox"
     try:
         # Already current (a sibling session fixed it)? Do not reap/restart.
         if _daemon_served_version() == TOKEN_OPTIMIZER_VERSION:
@@ -45488,8 +45511,8 @@ def run_ensure_health():
     try:
         current_marker = f'TOKEN_OPTIMIZER_DAEMON_VERSION = "{TOKEN_OPTIMIZER_VERSION}"'
         legacy_dir = RUNTIME_DIR / "_backups" / "token-optimizer"
-        candidate_paths = {SNAPSHOT_DIR / "dashboard-server.py",
-                           legacy_dir / "dashboard-server.py"}
+        candidate_paths = set() if _daemon_snapshot_sandboxed() else {
+            SNAPSHOT_DIR / "dashboard-server.py", legacy_dir / "dashboard-server.py"}
         # The auto-update refresh writes dashboard-server.py (not the LaunchAgent
         # plist) and reloads via `launchctl kickstart`, which restarts the process
         # without re-registering the background item -- so it does NOT fire the
@@ -46065,6 +46088,8 @@ def _ensure_health_daemon_revive_first():
     pulse provides a second, session-independent recovery path. Idempotent +
     fail-open: a spawn failure is swallowed, never raised into the hook.
     """
+    if _daemon_snapshot_sandboxed():
+        return "noop-sandbox"
     try:
         _proc = spawn_detached(
             [_detached_python_exe(), str(MEASURE_PY_PATH), "daemon-revive"],

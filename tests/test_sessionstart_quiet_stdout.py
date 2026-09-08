@@ -87,7 +87,7 @@ def _run_ensure_health_hook(home: Path) -> subprocess.CompletedProcess:
         "CODEX_HOME", "TOKEN_OPTIMIZER_RUNTIME", "CLAUDE_PLUGIN_DATA",
         "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID",
         "AI_AGENT", "CLAUDE_CODE_REMOTE", "CLAUDE_CODE_CONTAINER_ID",
-        "TOKEN_OPTIMIZER_SNAPSHOT_DIR", "TOKEN_OPTIMIZER_INTERACTIVE",
+        "TOKEN_OPTIMIZER_INTERACTIVE",
         "OPENCODE_HOME", "HERMES_HOME", "COPILOT_HOME",
         "TOKEN_OPTIMIZER_COPILOT_HOME", "TOKEN_OPTIMIZER_CURSOR_HOME",
         "TOKEN_OPTIMIZER_ANTIGRAVITY_HOME", "GROK_HOME",
@@ -95,6 +95,8 @@ def _run_ensure_health_hook(home: Path) -> subprocess.CompletedProcess:
     ):
         env.pop(var, None)
     env["CLAUDE_CONFIG_DIR"] = str(home)
+    env["HOME"] = str(home.parent)
+    env["TOKEN_OPTIMIZER_SNAPSHOT_DIR"] = str(home / "token-optimizer")
     env["TOKEN_OPTIMIZER_RUNTIME"] = "claude"
     payload = json.dumps({
         "cwd": str(REPO),

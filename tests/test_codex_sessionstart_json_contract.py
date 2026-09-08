@@ -421,17 +421,22 @@ def _run_hook(argv, source: str, home: Path) -> subprocess.CompletedProcess:
     ``CLAUDE_PLUGIN_ROOT`` set, ``CODEX_HOME`` and ``TOKEN_OPTIMIZER_RUNTIME``
     UNSET: that is the environment Codex gives a plugin hook (verified with an
     env-dumping hook), and the environment in which the old runtime-sniffing
-    guard silently did nothing. ``CLAUDE_CONFIG_DIR`` points at a tmp_path so the
-    run never touches the real ~/.claude.
+    guard silently did nothing. Test-only HOME, CLAUDE_CONFIG_DIR, and snapshot
+    overrides keep every config, data, and OS scheduler path inside tmp_path.
     """
     env = dict(os.environ)
     for var in ("CODEX_HOME", "TOKEN_OPTIMIZER_RUNTIME", "CLAUDE_PLUGIN_DATA",
                 "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID",
-                "AI_AGENT", "CLAUDE_CODE_REMOTE", "CLAUDE_CODE_CONTAINER_ID",
-                "TOKEN_OPTIMIZER_SNAPSHOT_DIR"):
+                "AI_AGENT", "CLAUDE_CODE_REMOTE", "CLAUDE_CODE_CONTAINER_ID"):
         env.pop(var, None)
     env["CLAUDE_PLUGIN_ROOT"] = str(REPO)
     env["CLAUDE_CONFIG_DIR"] = str(home)
+    # ensure-health dispatches a detached daemon-revive child. Isolate both
+    # path families it can mutate: config under CLAUDE_CONFIG_DIR and OS
+    # scheduler artifacts under HOME. The snapshot override also activates the
+    # production sandbox guard, so launchctl/systemd/schtasks cannot be called.
+    env["HOME"] = str(home.parent)
+    env["TOKEN_OPTIMIZER_SNAPSHOT_DIR"] = str(home / "token-optimizer")
     payload = json.dumps({
         "cwd": str(REPO),
         "hook_event_name": "SessionStart",

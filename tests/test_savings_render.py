@@ -16,7 +16,7 @@ def render(savings):
         pytest.skip('Node required to execute the dashboard renderer')
     html = TEMPLATE.read_text()
     body = html[html.index('  function renderSavings()'):html.index('  function renderHealth()')]
-    prefix = '''const data = JSON.parse(process.argv[1]);
+    prefix = '''const data = JSON.parse(process.argv[2]);
 const el = {innerHTML: '', querySelectorAll: () => []};
 const document = {getElementById: () => el};
 const esc = x => String(x == null ? '' : x).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -25,7 +25,13 @@ const tokensSavedCardHtml = () => '';
 const isCodex = false;
 const runtimeLabel = 'Claude Code';
 '''
-    result = subprocess.run([node, '-e', prefix + body + '\nrenderSavings(); process.stdout.write(el.innerHTML);', json.dumps({'savings': savings})], capture_output=True, text=True, check=True)
+    script = prefix + body + '\nrenderSavings(); process.stdout.write(el.innerHTML);'
+    # Windows limits CreateProcess command lines to about 32 KiB. Send the
+    # extracted renderer over stdin so the test exercises the real code there.
+    result = subprocess.run(
+        [node, '-', json.dumps({'savings': savings})],
+        input=script, capture_output=True, text=True, check=True,
+    )
     return result.stdout
 
 
@@ -88,6 +94,23 @@ def test_transformation_percentage_matches_dollars_and_method_is_folded():
     assert '<details open' not in card
     visible = card.split('<details')[0]
     assert len(re.sub('<[^>]+>', ' ', visible).split()) < 85
+
+
+def test_capped_transformation_percentage_matches_the_capped_dollars():
+    s = fixture()
+    s['before_after'].update({
+        'monthly_savings_usd': 100,
+        'uncapped_monthly_savings_usd': 900,
+        'actual_monthly_usd': 100,
+        'counterfactual_monthly_usd': 1000,
+        'transformation_pct': 0.1,
+        'savings_capped': True,
+        'savings_cap_note': 'Capped at actual spend; uncapped estimate was $900.',
+    })
+    card = render(s).split('savings-transformation')[1].split('savings-actions')[0]
+    assert '~10% lower cost' in card
+    assert '~90% lower cost' not in card
+    assert 'Capped at actual spend; uncapped estimate was $900.' in card
 
 
 def test_history_compares_same_context_cohort_and_discloses_overlap():

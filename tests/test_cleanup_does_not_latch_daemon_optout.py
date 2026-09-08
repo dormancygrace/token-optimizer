@@ -57,6 +57,8 @@ def measure(tmp_path, monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     sys.modules["measure"] = mod
     spec.loader.exec_module(mod)
+    # Each test replaces every platform uninstaller before calling setup_daemon.
+    monkeypatch.setattr(mod, "_daemon_snapshot_sandboxed", lambda: False)
     yield mod
     sys.modules.pop("measure", None)
 
