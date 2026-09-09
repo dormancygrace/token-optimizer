@@ -33143,6 +33143,19 @@ def _mark_ran_this_session(tag, session_id):
         pass
 
 
+def _safe_event(event):
+    """The hookEventName to stamp on an envelope: the firing event verbatim,
+    falling back to SessionStart only when it is missing or not a string.
+
+    Every emitter path (single-object passthrough, multi-object merge,
+    _emit_additional_context) MUST agree here. An earlier inline copy forced
+    SessionStart for any non-SessionStart event, so a UserPromptSubmit envelope
+    was stamped SessionStart and Claude Code discarded the whole hook result.
+    Keeping one helper stops that divergence from recurring per-path.
+    """
+    return event if (isinstance(event, str) and event) else "SessionStart"
+
+
 def _emit_additional_context(text, event="SessionStart"):
     """Emit hook stdout as the documented ``additionalContext`` JSON envelope.
 
@@ -33181,7 +33194,7 @@ def _emit_additional_context(text, event="SessionStart"):
     print(json.dumps({
         "continue": True,
         "hookSpecificOutput": {
-            "hookEventName": event,
+            "hookEventName": _safe_event(event),
             "additionalContext": text,
         },
     }))
@@ -33238,8 +33251,7 @@ def _sanitize_hook_output_payload(obj, event):
                     out[key] = value
     hso = obj.get("hookSpecificOutput")
     if isinstance(hso, dict):
-        safe_event = "SessionStart" if event != "SessionStart" else event
-        clean = {"hookEventName": safe_event}
+        clean = {"hookEventName": _safe_event(event)}
         ctx = hso.get("additionalContext")
         if isinstance(ctx, str) and ctx.strip():
             clean["additionalContext"] = ctx
@@ -33327,7 +33339,7 @@ def _collapse_hook_stdout(text, event="SessionStart"):
         payload["systemMessage"] = "\n\n".join(system_messages)
     if contexts:
         payload["hookSpecificOutput"] = {
-            "hookEventName": event,
+            "hookEventName": _safe_event(event),
             "additionalContext": "\n\n".join(contexts),
         }
     if not payload:
