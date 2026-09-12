@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import json
 import re
@@ -365,6 +366,30 @@ def _is_token_optimizer_group(group: Any) -> bool:
             or "TOKEN_OPTIMIZER_RUNTIME_ROOT=" in serialized)
 
 
+def _launcher_signature(command):
+    """Compare only generated Windows resolvers, ignoring their version fallback.
+
+    Preserving an equivalent installed command avoids an unnecessary trust
+    review on upgrade. Changes to the interpreter, parent, script, arguments,
+    environment, redirection or any bootstrap logic still require review.
+    """
+    match = re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)", command)
+    if not match or 'token-optimizer/scripts/windows-launcher' not in command:
+        return command
+    try:
+        code = base64.b64decode(match[1]).decode('utf-8')
+        root_line = re.search(r'^root = Path\((.+)\)$', code, re.M)
+        if not root_line:
+            return command
+        root = Path(ast.literal_eval(root_line[1]))
+        if not _SEMVER_DIR_RE.fullmatch(root.name):
+            return command
+        code = code[:root_line.start()] + f'root = Path({str(root.parent)!r})' + code[root_line.end():]
+        return command[:match.start(1)] + code + command[match.end(1):]
+    except (ValueError, SyntaxError, UnicodeError):
+        return command
+
+
 def _merge_hooks(
     existing: dict[str, Any],
     *,
@@ -385,6 +410,16 @@ def _merge_hooks(
         groups = hooks.get(event, [])
         if not isinstance(groups, list):
             groups = []
+        for fresh_group in managed.get(event, []):
+            for old_group in groups:
+                if not _is_token_optimizer_group(old_group):
+                    continue
+                old_handlers = old_group.get('hooks', [])
+                fresh_handlers = fresh_group.get('hooks', [])
+                if len(old_handlers) == len(fresh_handlers) == 1:
+                    old_handler, fresh_handler = old_handlers[0], fresh_handlers[0]
+                    if _launcher_signature(old_handler.get('command', '')) == _launcher_signature(fresh_handler.get('command', '')):
+                        fresh_handler['command'] = old_handler['command']
         hooks[event] = [group for group in groups if not _is_token_optimizer_group(group)]
         hooks[event].extend(managed.get(event, []))
         if not hooks[event]:

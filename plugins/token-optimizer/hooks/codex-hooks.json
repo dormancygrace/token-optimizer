@@ -1,0 +1,4 @@
+{
+  "description": "Codex uses OS-specific global hooks installed by codex-install.",
+  "hooks": {}
+}

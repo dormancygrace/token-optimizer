@@ -29978,11 +29978,15 @@ def quality_analyzer(session_id=None, as_json=False):
 
     grade = result.get("grade", score_to_grade(round(score)))
 
-    print("\n  Context Quality Report")
+    is_codex = detect_runtime() == "codex"
+    print("\n  Context Resource Report" if is_codex else "\n  Context Quality Report")
     print(f"  {'=' * 40}")
-    print(f"  Content quality:     {grade} ({score}/100) ({band})")
+    print(f"  {'Resource health:' if is_codex else 'Content quality:':20s} {grade} ({score}/100) ({band})")
     if fill_band:
-        print(f"  Degradation band:    {fill_band} ({cfd.get('fill_pct', 0):.0f}% fill, ~{cfd.get('quality_estimate', 0)}/100 MRCR)")
+        if is_codex:
+            print(f"  Context pressure:    {fill_band} ({cfd.get('fill_pct', 0):.0f}% fill; not model accuracy)")
+        else:
+            print(f"  Degradation band:    {fill_band} ({cfd.get('fill_pct', 0):.0f}% fill, ~{cfd.get('quality_estimate', 0)}/100 MRCR)")
     print(f"  Messages analyzed:   {result['total_messages']}")
     print(f"  Decisions captured:  {result['decisions_found']}")
     print()
@@ -30034,7 +30038,10 @@ def quality_analyzer(session_id=None, as_json=False):
         print("  Session is clean. No action needed.")
 
     # Cache preservation tip when compactions detected
-    if compactions > 0:
+    if compactions > 0 and is_codex:
+        print(f"  Continuity: {compactions} compaction(s) recorded; use checkpoints to preserve decisions.")
+        print("  Subscription quota impact and information loss are not measured by this score.")
+    elif compactions > 0:
         print("  Cache impact:")
         print(f"    {compactions} compaction(s) triggered full cache rebuilds this session.")
         print("    Each rebuild re-bills all context at full input price (not cached 10% rate).")

@@ -133,7 +133,21 @@ def test_native_powershell_compression_and_failure_exit(tmp_path):
 
 def test_codex_manifest_does_not_load_claude_hook_bundle():
     manifest = json.loads((SCRIPTS.parents[2] / '.codex-plugin/plugin.json').read_text())
-    assert manifest['hooks'] == []
+    assert manifest['hooks'] == './hooks/codex-hooks.json'
+    assert json.loads((SCRIPTS.parents[2] / manifest['hooks']).read_text())['hooks'] == {}
+
+
+def test_install_preserves_equivalent_version_resolver_but_not_changed_logic(monkeypatch, tmp_path):
+    import codex_install as installer
+    monkeypatch.setattr(installer.sys, 'platform', 'win32')
+    monkeypatch.setattr(installer, '_repo_root', lambda: tmp_path / '5.13.8')
+    old = installer._managed_hooks(enable_prompt_hooks=True)
+    monkeypatch.setattr(installer, '_repo_root', lambda: tmp_path / '5.13.11')
+    merged = installer._merge_hooks({'hooks': old}, enable_prompt_hooks=True)['hooks']
+    assert merged == old
+    old['Stop'][0]['hooks'][0]['command'] += ' changed'
+    merged = installer._merge_hooks({'hooks': old}, enable_prompt_hooks=True)['hooks']
+    assert not merged['Stop'][0]['hooks'][0]['command'].endswith(' changed')
 
 
 def test_compaction_events_use_only_matching_task(monkeypatch, tmp_path):

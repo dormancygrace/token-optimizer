@@ -3,7 +3,7 @@
   "version": "5.13.11",
   "description": "Audit, monitor, and reduce Codex context waste with continuity helpers and explicit outline tools.",
   "skills": "./skills/",
-  "hooks": [],
+  "hooks": "./hooks/codex-hooks.json",
   "interface": {
     "displayName": "Token Optimizer",
     "shortDescription": "Find the ghost tokens in Codex sessions.",
