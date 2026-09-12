@@ -157,6 +157,14 @@ def test_codex_daemon_uses_native_lifecycle(measure, monkeypatch):
     monkeypatch.setattr(m, '_verify_daemon_port', lambda **kw: True)
     assert m._ensure_dashboard_daemon() == 'noop-healthy'
 
+def test_windows_daemon_registration_only_requires_user_logon(measure):
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(measure._generate_schtasks_xml('Test', 'DOMAIN\\user', 'pythonw.exe'))
+    ns = {'t': 'http://schemas.microsoft.com/windows/2004/02/mit/task'}
+    assert root.find('.//t:LogonTrigger', ns) is not None
+    assert root.find('.//t:BootTrigger', ns) is None
+    assert root.find('.//t:RunLevel', ns).text == 'LeastPrivilege'
+
 def test_compact_prompt_is_root_key_and_preserves_tables():
     original = 'model = "gpt-5.4"\n[plugins.example]\nenabled = true\n'
     updated, _ = cp._replace_or_append_config(original, Path('/prompt.md'), force=False)

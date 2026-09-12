@@ -26628,8 +26628,9 @@ def _generate_schtasks_xml(task_name, user_id, command, arguments=""):
     # No <URI> element: it is optional per the Task Scheduler 1.2 schema
     # and creates a mismatch class when enterprise GPO relocates tasks
     # into subfolders. /TN in the schtasks /Create call is sufficient.
-    # Two triggers: LogonTrigger for normal logins + BootTrigger so Fast
-    # Startup (hibernate-kernel wake) still fires the daemon.
+    # A BootTrigger requires elevated registration even with LeastPrivilege.
+    # This is a per-user service: logon is the correct boundary, including
+    # logins following Fast Startup. Keep installation non-elevated.
     return (
         '<?xml version="1.0" encoding="UTF-16"?>\n'
         '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
@@ -26641,9 +26642,6 @@ def _generate_schtasks_xml(task_name, user_id, command, arguments=""):
         "      <Enabled>true</Enabled>\n"
         f"      <UserId>{xml_escape(user_id)}</UserId>\n"
         "    </LogonTrigger>\n"
-        "    <BootTrigger>\n"
-        "      <Enabled>true</Enabled>\n"
-        "    </BootTrigger>\n"
         "  </Triggers>\n"
         "  <Principals>\n"
         '    <Principal id="Author">\n'
