@@ -7,6 +7,10 @@ import argparse
 import json
 import os
 import re
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
 from pathlib import Path
 from typing import Any
 
@@ -229,9 +233,18 @@ def _compact_prompt_check() -> dict[str, str]:
     except OSError:
         return _check("FAIL", "Compact prompt", f"{config_path} not found; run measure.py codex-compact-prompt --install")
     expected = codex_home() / "token-optimizer" / "codex-compact-prompt.md"
-    if str(expected) in text and expected.exists():
-        return _check("OK", "Compact prompt", str(expected))
-    if "compact_prompt" in text or "experimental_compact_prompt_file" in text:
+    if tomllib is None:
+        return _check("WARN", "Compact prompt", "Python 3.11+ required to validate TOML configuration")
+    try:
+        config = tomllib.loads(text)
+    except ValueError:
+        return _check("FAIL", "Compact prompt", "invalid config.toml")
+    configured = config.get("experimental_compact_prompt_file")
+    if isinstance(configured, str) and Path(configured).expanduser().resolve() == expected.resolve():
+        if expected.is_file():
+            return _check("OK", "Compact prompt", str(expected))
+        return _check("FAIL", "Compact prompt", f"configured file is missing: {expected}")
+    if configured or config.get("compact_prompt"):
         return _check("WARN", "Compact prompt", "custom compact prompt configured")
     return _check("FAIL", "Compact prompt", "not configured yet; run measure.py codex-compact-prompt --install")
 
@@ -367,7 +380,7 @@ def _has_project_hook(hooks: dict[str, Any], event: str, matcher: str | None, co
             command = hook.get("command", "")
             if not isinstance(command, str):
                 continue
-            bundled = event in ('Stop', 'UserPromptSubmit') and 'token-optimizer/scripts/windows-launcher' in command
+            bundled = event in ('Stop', 'UserPromptSubmit', 'SubagentStart', 'SubagentStop') and 'token-optimizer/scripts/windows-launcher' in command
             runner = {'Stop': 'stop_runner.py', 'UserPromptSubmit': 'userpromptsubmit_runner.py'}.get(event)
             if command_needle in command or bundled or (runner and runner in command):
                 return True

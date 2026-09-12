@@ -7010,6 +7010,7 @@ def generate_standalone_dashboard(days=30, quiet=False, force=False):
         "savings": savings_data,
         "cache_health": cache_health,
         "standalone": True,
+        "codex_state": _codex_state_summary(),
         "auto_plan": True,
         "generated_at": datetime.now().isoformat(),
         "pricing_tier": pricing_tier,
@@ -18658,7 +18659,7 @@ def _dashboard_savings_data(days=30, include_billing_mode=False, fail_open=False
     if not isinstance(savings_data, dict):
         savings_data = {"total_tokens": 0, "total_cost_usd": 0.0,
                         "by_category": {}}
-    if source_failed:
+    if source_failed or detect_runtime() == 'codex':
         return savings_data
     try:
         savings_data["since_install"] = _savings_since_install()
@@ -21377,7 +21378,8 @@ def _collect_trends_from_jsonl(days=30):
         "total_cache_read": total_cache_read,
         "total_cache_create": total_cache_create,
         "total_billable_tokens": max(0, total_input - total_cache_read) + total_output,
-        "total_tokens": total_reported_input + total_reported_output,
+        "total_tokens": (total_input + total_output if detect_runtime() == 'codex'
+                         else total_reported_input + total_reported_output),
         "spent_token_basis": {
             "tokens": total_reported_input + total_reported_output,
             "basis": (_DASHBOARD_SPENT_TOKEN_BASIS if reported_complete else
@@ -39771,6 +39773,9 @@ def _estimate_compression_cost_per_mtok(model=None):
     store token counts. Uses the session's actual model (via _resolve_session_model
     when model arg is None). Falls back to Sonnet's published rate on any error.
     """
+    if detect_runtime() == 'codex':
+        rates = _input_and_cached_read_rates(model or _resolve_session_model())
+        return rates[0] if rates else 0.0
     try:
         tier = _load_pricing_tier()
         tier_data = PRICING_TIERS.get(tier, PRICING_TIERS.get("anthropic", {}))
@@ -39900,6 +39905,10 @@ def runway_snapshot(days=30, now=None):
     window whose reading is older than the window itself (its limit has reset).
     Silence only when there is no reading to show. Never raises.
     """
+    if detect_runtime() == 'codex':
+        # Codex account snapshots are shown directly in its runtime card.
+        # Claude price ratios cannot estimate Codex subscription headroom.
+        return None
     try:
         meters = _keepwarm_read_meters(now=now)
         # The live meter feeds ONLY the per-window bars. The headline throughput
@@ -41574,6 +41583,13 @@ def _dashboard_spent_token_basis(conn, days=30):
     use the older fresh-input plus deduped-output reconstruction and are marked
     incomplete so callers can disclose the fallback.
     """
+    if detect_runtime() == 'codex':
+        row = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) "
+            "FROM session_log WHERE date >= date('now', ?)", (f"-{days} day",),
+        ).fetchone()
+        return {"tokens": int(row[0]), "basis": "logged input (including cached input) + output; reasoning is included in output",
+                "complete": True, "fallback_rows": 0}
     columns = {row[1] for row in conn.execute("PRAGMA table_info(session_log)")}
     select = [
         "reported_input_tokens" if "reported_input_tokens" in columns else "NULL",
@@ -43961,6 +43977,46 @@ def _progressive_disclosure_summary(days=30):
     return out
 
 
+def _codex_savings_summary(savings, compression, days):
+    """Separate observed actions, local text reductions and counterfactual estimates.
+
+    Legacy loop/nudge rows describe detected text, not an applied replacement.
+    A checkpoint's avoided rereads are also counterfactual, even when its size
+    was measured. Neither belongs in the measured reduction total.
+    """
+    measured = {}
+    activity = {}
+    estimates = {}
+    applied = {'tool_archive', 'tool_archive_refetch_block', 'structure_map',
+               'contextignore_block', 'redundant_block', 'delta_read'}
+    applied.update(_V5_COMPRESSION_CATEGORIES - set(_COUNTED_CE_EXCLUDED_FEATURES))
+    categories = dict(savings.get('by_category') or {})
+    for name, item in (compression.get('by_feature') or {}).items():
+        categories.setdefault(name, item)
+    for name, item in categories.items():
+        activity[name] = int(item.get('events') or 0)
+        (measured if name in applied else estimates)[name] = dict(item)
+    for key in ('mcp_cap_estimated', 'hint_followed_estimated', 'verbosity_steer_estimated',
+                'resume_lean_estimated', 'one_time_setup'):
+        item = savings.get(key)
+        if item:
+            estimates[key] = dict(item)
+            activity[key] = int(item.get('events') or 0)
+    # Loop/nudge token deltas are diagnostics; do not even count them as an
+    # avoided-work estimate. Keep their action counts visible.
+    for name in _COUNTED_CE_EXCLUDED_FEATURES:
+        if name != 'delta_read':
+            estimates.pop(name, None)
+    tokens = sum(int(x.get('tokens_saved') or 0) for x in measured.values())
+    cost = sum(float(x.get('cost_saved_usd') or 0) for x in measured.values())
+    return {'total_tokens': tokens, 'total_cost_usd': round(cost, 4),
+            'total_events': sum(int(x.get('events') or 0) for x in measured.values()),
+            'by_category': measured, 'period_days': days, 'daily_avg_usd': cost / max(days, 1),
+            'codex_activity': activity, 'codex_estimates': estimates,
+            'codex_estimated_tokens': sum(int(x.get('tokens_saved') or 0) for x in estimates.values()),
+            'measurement_note': 'Local text reductions use token estimates; subscription quota impact is not exposed.'}
+
+
 def _get_merged_savings(days=30, since=None):
     """Merge savings_events and compression_events into one unified savings view.
 
@@ -43978,6 +44034,8 @@ def _get_merged_savings(days=30, since=None):
     """
     savings = _get_savings_summary(days=days, since=since)
     compression = _get_compression_summary(days=days, since=since)
+    if detect_runtime() == 'codex':
+        return _codex_savings_summary(savings, compression, days)
 
     by_category = dict(savings.get("by_category", {}))
     total_tokens = int(savings.get("total_tokens", 0) or 0)

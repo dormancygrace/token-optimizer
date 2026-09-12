@@ -140,10 +140,12 @@ def test_codex_global_consolidated_hooks_are_recognized(measure, monkeypatch, tm
     import codex_doctor as doctor
     monkeypatch.setattr(doctor, 'codex_home', lambda: tmp_path)
     hook = {'hooks': [{'type': 'command', 'command': 'python -c encoded token-optimizer/scripts/windows-launcher'}]}
-    (tmp_path / 'hooks.json').write_text(json.dumps({'hooks': {'Stop': [hook], 'UserPromptSubmit': [hook]}}))
+    (tmp_path / 'hooks.json').write_text(json.dumps({'hooks': {'Stop': [hook], 'UserPromptSubmit': [hook], 'SubagentStart': [hook]}}))
     checks = {c['name']: c['status'] for c in doctor._project_feature_checks(tmp_path / 'project')}
     assert checks['Feature: Session continuity and dashboard refresh'] == 'OK'
     assert checks['Optional feature: Prompt quality nudges'] == 'OK'
+    details = {c['name']: c['detail'] for c in doctor._project_feature_checks(tmp_path / 'project')}
+    assert details['Optional feature: Subagent sprawl tracking'].startswith('enabled')
     monkeypatch.setattr(measure, 'codex_home', lambda: tmp_path)
     assert measure._collect_codex_hook_status_for_dashboard()['codex_balanced_profile']['installed']
 
@@ -172,6 +174,50 @@ def test_compact_prompt_is_root_key_and_preserves_tables():
     assert parsed.pop('experimental_compact_prompt_file') == str(Path('/prompt.md'))
     assert parsed == tomllib.loads(original)
 
+
+def test_doctor_parses_escaped_prompt_path_and_ignores_table_keys(monkeypatch, tmp_path):
+    import codex_doctor as doctor
+    monkeypatch.setattr(doctor, 'codex_home', lambda: tmp_path)
+    target = tmp_path / 'token-optimizer/codex-compact-prompt.md'
+    target.parent.mkdir()
+    target.write_text('prompt')
+    config = tmp_path / 'config.toml'
+    config.write_text('experimental_compact_prompt_file = ' + json.dumps(str(target)))
+    assert doctor._compact_prompt_check()['status'] == 'OK'
+    target.unlink()
+    assert doctor._compact_prompt_check()['status'] == 'FAIL'
+    config.write_text('[plugins.example]\nexperimental_compact_prompt_file = ' + json.dumps(str(target)))
+    assert doctor._compact_prompt_check()['status'] == 'FAIL'
+
+
+def test_codex_trends_count_inclusive_input_once_despite_zero_claude_columns(measure):
+    conn = measure._init_trends_db()
+    conn.execute("INSERT INTO session_log (jsonl_path,date,input_tokens,output_tokens,reported_input_tokens,reported_output_tokens,cache_hit_rate) VALUES ('fixture',date('now'),200,40,0,0,0.5)")
+    result = measure._dashboard_spent_token_basis(conn)
+    conn.close()
+    assert result['tokens'] == 240
+    assert 'cached input' in result['basis']
+
+
+def test_codex_recovery_and_loop_warnings_are_not_measured_savings(measure):
+    savings = {'by_category': {'checkpoint_restore': {'events': 2, 'tokens_saved': 1000},
+                              'tool_archive': {'events': 1, 'tokens_saved': 100}},
+               'verbosity_steer_estimated': {'events': 3, 'tokens_saved': 0}}
+    compression = {'by_feature': {'loop_detection': {'events': 4, 'tokens_saved': 10000},
+                                  'bash_compress_git': {'events': 1, 'tokens_saved': 50}}}
+    result = measure._codex_savings_summary(savings, compression, 30)
+    assert result['total_tokens'] == 150
+    assert result['total_events'] == 2
+    assert result['codex_estimated_tokens'] == 1000
+    assert result['codex_activity']['loop_detection'] == 4
+    assert result['codex_activity']['verbosity_steer_estimated'] == 3
+
+
+def test_codex_compression_rate_never_uses_sonnet_fallback(measure):
+    assert measure._estimate_compression_cost_per_mtok('gpt-6-astra') == 10
+    assert measure._estimate_compression_cost_per_mtok('unknown') == 0
+    assert measure.runway_snapshot() is None
+
 def test_repair_and_uninstall_preserve_entries_inside_old_markers():
     original = ('[plugins.example]\nenabled = true\n' + cp.MANAGED_BEGIN + '\n'
                 'experimental_compact_prompt_file = "/old.md"\n'
@@ -186,6 +232,8 @@ def test_repair_and_uninstall_preserve_entries_inside_old_markers():
 
 @pytest.fixture
 def measure(tmp_path, monkeypatch):
+    import runtime_env
+    runtime_env.detect_runtime.cache_clear()
     monkeypatch.setenv('TOKEN_OPTIMIZER_RUNTIME', 'codex')
     monkeypatch.setenv('TOKEN_OPTIMIZER_SNAPSHOT_DIR', str(tmp_path / 'data'))
     import measure as m
@@ -193,7 +241,8 @@ def measure(tmp_path, monkeypatch):
     monkeypatch.setattr(m, 'TRENDS_DB', tmp_path / 'data/trends.db')
     monkeypatch.setattr(m, 'detect_runtime', lambda: 'codex')
     monkeypatch.setattr(cs, 'session_roots', lambda: (tmp_path / 'sessions',))
-    return m
+    yield m
+    runtime_env.detect_runtime.cache_clear()
 
 def test_model_attribution_is_session_scoped(measure, tmp_path, monkeypatch):
     write_session(tmp_path / 'sessions' / f'rollout-2026-09-06-{SID}.jsonl')

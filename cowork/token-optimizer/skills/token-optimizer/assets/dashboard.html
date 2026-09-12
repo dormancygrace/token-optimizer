@@ -3403,6 +3403,24 @@ var DB = (function() {
   // model tag). Returns '' when the card should not render.
   function tokensSavedCardHtml(savings) {
     var s = savings || {};
+    if (data.runtime === 'codex') {
+      var activity = s.codex_activity || {};
+      var labels = {checkpoint_restore: 'Checkpoint restores', loop_detection: 'Loop warnings',
+        verbosity_steer_estimated: 'Conciseness nudges', quality_nudge: 'Quality nudges'};
+      var cx = '<div class="card wide"><div class="card-header"><span>Optimization activity</span><span class="label">Last ' + (Number(s.period_days) || 30) + ' days</span></div>';
+      cx += '<div class="metric-large">' + fn(s.total_tokens || 0) + '</div><div class="metric-unit">tokens removed by applied text replacements</div>';
+      cx += '<p>These are local text-size measurements using estimated token counts. Restores and warnings do not prove that later work was avoided. Subscription quota impact is not exposed.</p>';
+      cx += '<div class="metric-sub">Estimated avoided work: ' + fn(s.codex_estimated_tokens || 0) + ' tokens (counterfactual; separate from applied reductions).</div><ul>';
+      Object.keys(activity).forEach(function(key) {
+        cx += '<li>' + esc(labels[key] || key.replace(/_/g, ' ')) + ': ' + fn(activity[key]) + '</li>';
+      });
+      cx += '</ul>';
+      var mix = (data.trends || {}).model_mix || {};
+      if (Object.keys(mix).length) {
+        cx += '<div class="ts-section-label"><span>Model usage: fresh input + output</span></div>' + modelMixBodyHtml(mix, true);
+      }
+      return cx + '</div>';
+    }
     var tsSavedTokens = Number(s.total_tokens) || 0;
     if (tsSavedTokens <= 0) return '';
     var tsTrends = data.trends || {};
@@ -4252,6 +4270,10 @@ var DB = (function() {
   function renderSavings() {
     var el = document.getElementById('view-savings');
     if (!el) return;
+    if (data.runtime === 'codex') {
+      el.innerHTML = '<div class="section-header"><h1>Optimization activity</h1><p>Observed actions and local text reductions in Codex.</p></div>' + tokensSavedCardHtml(data.savings || {});
+      return;
+    }
     // Live refresh must not close the explanation someone is reading.
     var openFolds = Array.from(el.querySelectorAll('details[open] > summary')).map(function(summary) {
       return summary.textContent;
