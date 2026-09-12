@@ -29,6 +29,7 @@ intentionally out of scope.
 """
 
 from __future__ import annotations
+import os
 
 import math
 import re
@@ -294,6 +295,10 @@ def current_thread_id() -> str | None:
     """
     if not _is_codex():
         return None
+    for name in ('TOKEN_OPTIMIZER_SESSION_ID', 'CODEX_THREAD_ID'):
+        sid = os.environ.get(name)
+        if sid:
+            return sid
     db = _find_versioned_db("state", "threads")
     if db is None:
         return None

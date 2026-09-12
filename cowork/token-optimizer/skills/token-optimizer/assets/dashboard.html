@@ -3149,6 +3149,9 @@ var DB = (function() {
         if (existingCsCard) existingCsCard.parentNode.removeChild(existingCsCard);
         var sub = cs.subagents || {}, mem = cs.memory || {}, goals = cs.goals || {};
         var rows = '';
+        if (cs.available_models && cs.available_models.length) {
+          rows += '<div class="note">Models from this Codex client: ' + cs.available_models.map(function(m) { return esc(m.name); }).join(', ') + '. Context limits use local Codex metadata, not API maximums.</div>';
+        }
         if (sub.available) {
           var leakWarn = sub.leaked_subagents > 0
             ? ' &middot; <span style="color:var(--c-warning, #ff9f43);font-weight:600;">' + sub.leaked_subagents + ' leaked</span>' : '';

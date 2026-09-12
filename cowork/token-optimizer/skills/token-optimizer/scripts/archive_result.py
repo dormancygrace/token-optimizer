@@ -43,7 +43,7 @@ from hook_io import read_stdin_hook_input
 from hook_runtime import LeaseLock
 from plugin_env import resolve_snapshot_dir, snapshot_dir_candidates
 from refetch_fingerprint import ARGS_HASH_KEY, expand_command, tool_fingerprint
-from runtime_env import claude_home
+from runtime_env import claude_home, detect_runtime
 from session_store import SessionStore, _sanitize_session_id as sanitize_sid
 
 # ---------------------------------------------------------------------------
@@ -113,10 +113,11 @@ _SAVINGS_DB_TIMEOUT_SECONDS = 0.05
 _SAVINGS_DB_BUSY_TIMEOUT_MS = 50
 _DEFAULT_SAVINGS_COST_PER_MTOK = 3.0  # Sonnet input rate; safe fallback for hook-only pricing.
 _HOOK_INPUT_COST_PER_MTOK = {
-    "gpt-5.6-sol": 5.0,
+    "gpt-6-astra": 10.0,
+    "gpt-5.6-sol": 4.0,
     "gpt-5.6-terra": 2.0,
     "gpt-5.6-luna": 0.20,
-    "gpt-5.6": 5.0,
+    "gpt-5.6": 4.0,
     "gpt-5.5-pro": 30.0,
     "gpt-5.1-codex-mini": 0.25,
     "gpt-4o-mini": 0.15,
@@ -616,6 +617,7 @@ def _estimate_savings_cost_per_mtok() -> float:
         except ValueError:
             pass
 
+    is_codex = detect_runtime() == 'codex'
     model = (
         os.environ.get("CLAUDE_MODEL")
         or os.environ.get("ANTHROPIC_MODEL")
@@ -624,6 +626,8 @@ def _estimate_savings_cost_per_mtok() -> float:
         or os.environ.get("MODEL")
         or ""
     ).lower()
+    if is_codex:
+        model = (os.environ.get('CODEX_MODEL') or os.environ.get('OPENAI_MODEL') or '').lower()
     model = re.sub(r"[\s_]+", "-", model.rsplit("/", 1)[-1].rsplit(":", 1)[-1])
     if "fable" in model:
         return 10.0
@@ -634,7 +638,7 @@ def _estimate_savings_cost_per_mtok() -> float:
     for alias, rate in _HOOK_INPUT_COST_PER_MTOK.items():
         if model == alias or model.startswith(alias + "-"):
             return rate
-    return _DEFAULT_SAVINGS_COST_PER_MTOK
+    return 0.0 if is_codex else _DEFAULT_SAVINGS_COST_PER_MTOK
 
 
 # ---------------------------------------------------------------------------

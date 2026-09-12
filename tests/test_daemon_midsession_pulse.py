@@ -142,10 +142,18 @@ def test_healthy_daemon_no_spawn(m, monkeypatch):
 
 
 def test_foreign_runtime_noop(m, monkeypatch):
-    monkeypatch.setattr(m, "detect_runtime", lambda: "codex")
+    monkeypatch.setattr(m, "detect_runtime", lambda: "opencode")
     spawns = _count_spawns(m, monkeypatch)
     assert m._daemon_midsession_pulse() == "noop-foreign"
     assert spawns["n"] == 0
+
+
+def test_codex_runtime_can_revive_its_dashboard(m, monkeypatch):
+    monkeypatch.setattr(m, 'detect_runtime', lambda: 'codex')
+    monkeypatch.setattr(m, '_verify_daemon_port', lambda **k: False)
+    spawns = _count_spawns(m, monkeypatch)
+    assert m._daemon_midsession_pulse() == 'revive-spawned'
+    assert spawns['n'] == 1
 
 
 def test_unsupported_platform_noop(m, monkeypatch):

@@ -113,7 +113,7 @@ from plugin_env import (
     snapshot_dir_candidates,
 )
 from utf8_io import enforce_utf8_io, reexec_in_utf8_mode
-from runtime_env import _safe_home, claude_home, detect_runtime, is_cowork, runtime_home, runtime_name_for_humans
+from runtime_env import _safe_home, claude_home, codex_home, detect_runtime, is_cowork, runtime_home, runtime_name_for_humans
 from spawn_utils import spawn_detached
 
 # Every console-attached child we spawn on Windows flashes a cmd
@@ -821,7 +821,7 @@ OPENAI_MODEL_PRICING = {
     "gpt-5.5": {"input": 5.0, "cache_read": 0.50, "output": 30.0},
     "gpt-5.5-pro": {"input": 30.0, "cache_read": 30.0, "output": 180.0},  # cache_read N/A per OpenAI; billed at full input rate
     # GPT-5.6 family. Cache writes cost 1.25x the applicable input rate.
-    "gpt-5.6-sol": {"input": 5.0, "cache_read": 0.50, "cache_write": 6.25, "output": 30.0},
+    "gpt-5.6-sol": {"input": 4.0, "cache_read": 0.40, "cache_write": 5.0, "output": 20.0},
     "gpt-5.6-terra": {"input": 2.0, "cache_read": 0.20, "cache_write": 2.50, "output": 12.0},
     "gpt-5.6-luna": {"input": 0.20, "cache_read": 0.02, "cache_write": 0.25, "output": 1.20},
     # GPT-4.x family
@@ -840,7 +840,7 @@ OPENAI_LONG_CONTEXT_PRICING = {
     "gpt-6-astra": {"input": 20.0, "cache_read": 2.0, "cache_write": 25.0, "output": 75.0},
     "gpt-5.4": {"input": 5.0, "cache_read": 0.50, "output": 22.5},
     "gpt-5.5": {"input": 10.0, "cache_read": 1.0, "output": 45.0},
-    "gpt-5.6-sol": {"input": 10.0, "cache_read": 1.0, "cache_write": 12.50, "output": 45.0},
+    "gpt-5.6-sol": {"input": 8.0, "cache_read": 0.80, "cache_write": 10.0, "output": 30.0},
     "gpt-5.6-terra": {"input": 4.0, "cache_read": 0.40, "cache_write": 5.0, "output": 18.0},
     "gpt-5.6-luna": {"input": 0.40, "cache_read": 0.04, "cache_write": 0.50, "output": 1.80},
 }
@@ -3092,7 +3092,8 @@ def _codex_config_model() -> str | None:
 
 def _latest_codex_logged_context_window() -> tuple[int | None, str | None]:
     try:
-        files = codex_session.find_all_jsonl_files(days=30)
+        current = _find_current_session_jsonl()
+        files = [(current, 0, '')] if current else []
     except Exception:
         return None, None
     for path, _mtime, _project in files[:25]:
@@ -3184,8 +3185,10 @@ def detect_context_window():
         if configured_window:
             return remember((configured_window, "codex config: model_context_window"))
         model = os.environ.get("CODEX_MODEL") or os.environ.get("OPENAI_MODEL") or _codex_config_model()
-        if _normalize_openai_model_name(model) == 'gpt-6-astra':
-            return remember((1_050_000, 'OpenAI published GPT-6 Astra context window'))
+        import codex_models
+        window = codex_models.effective_window(model)
+        if window:
+            return remember((window, f'Codex model catalog: {model}'))
         model_note = f" for {model}" if model else ""
         return remember((CODEX_DEFAULT_EFFECTIVE_CONTEXT_WINDOW, f"Codex conservative effective window{model_note} (override: TOKEN_OPTIMIZER_CONTEXT_SIZE)"))
     # Hermes: Hermes does not expose a model field in
@@ -3317,6 +3320,8 @@ def _interpolate_curve(value, curve):
 
 def _quality_curve_for_model(model):
     m = str(model or "").lower()
+    if 'gpt-5.6' in m or 'daybreak' in m or m == 'gpt-reserve':
+        return 'openai-gpt-5.5-proxy (uncalibrated)', _OPENAI_GPT55_MRCR_TOKENS, 'absolute_tokens'
     if 'gpt-6-astra' in m:
         # No calibrated Astra retrieval curve is bundled. Label the proxy
         # explicitly instead of silently treating Astra as an Anthropic model.
@@ -5155,8 +5160,10 @@ def _codex_state_summary():
         "effort": None,
         "compaction": None,
     }
+    import codex_models
+    summary['available_models'] = codex_models.visible_models()
     try:
-        current = codex_session.find_current_session_jsonl()
+        current = _find_current_session_jsonl()
         if current:
             session = codex_session.parse_session_jsonl(current)
             if session:
@@ -5550,9 +5557,13 @@ def _collect_codex_hook_status_for_dashboard():
     project_arg = shlex.quote(str(project))
     base = f"TOKEN_OPTIMIZER_RUNTIME=codex python3 {mp_cmd} codex-install --project {project_arg}"
     try:
-        hooks_text = (project / ".codex" / "hooks.json").read_text(encoding="utf-8")
+        hooks_text = (codex_home() / 'hooks.json').read_text(encoding='utf-8')
     except OSError:
         hooks_text = ""
+    try:
+        hooks_text += (project / '.codex/hooks.json').read_text(encoding='utf-8')
+    except OSError:
+        pass
     return {
         "codex_project": {
             "installed": _ok("Project hooks"),
@@ -5578,7 +5589,7 @@ def _collect_codex_hook_status_for_dashboard():
             "uninstall_cmd": base + " --disable-bash-compression",
         },
         "codex_balanced_profile": {
-            "installed": "UserPromptSubmit" in hooks_text and "codex_hook_bridge.py" in hooks_text,
+            "installed": "UserPromptSubmit" in hooks_text and "token-optimizer/scripts" in hooks_text,
             "label": "Balanced Quality Profile",
             "description": "Default profile. Enables prompt/session hooks for live quality cache and loop nudges with far less noise than per-tool hooks.",
             "install_cmd": base,
@@ -7191,7 +7202,12 @@ def _run_session_end_flush_worker(args):
             except Exception:
                 pass
             try:
-                generate_standalone_dashboard(days=30, quiet=True)
+                if detect_runtime() == 'codex':
+                    # Windows watchdogs hard-exit the flush; exceptions cannot
+                    # rescue a dashboard build exceeding the remaining budget.
+                    _spawn_detached_dashboard_selfheal(days=30)
+                else:
+                    generate_standalone_dashboard(days=30, quiet=True)
             except _HookTimeout:
                 # Gap 4: the bounded SessionEnd regen was killed by the 20s budget
                 # (a large history's 4 MB build does not fit), so it may have left
@@ -7211,7 +7227,8 @@ def _run_session_end_flush_worker(args):
                 for i, a in enumerate(args):
                     if a == "--trigger" and i + 1 < len(args):
                         flush_trigger = args[i + 1]
-                compact_capture(trigger=flush_trigger, backfill_tools=True)
+                if detect_runtime() != 'codex':
+                    compact_capture(trigger=flush_trigger, backfill_tools=True)
             except Exception:
                 pass
             # Data-retention enforcement (enterprise compliance)
@@ -23562,8 +23579,9 @@ def _read_plugin_version(default="0.0.0"):
     string is cosmetic and must not prevent the tool from running.
     """
     here = Path(__file__).resolve()
+    manifest_dir = '.codex-plugin' if detect_runtime() == 'codex' else '.claude-plugin'
     for base in here.parents:
-        candidate = base / ".claude-plugin" / "plugin.json"
+        candidate = base / manifest_dir / "plugin.json"
         try:
             if candidate.is_file():
                 value = json.loads(candidate.read_text(encoding="utf-8")).get("version")
@@ -27899,7 +27917,7 @@ def _ensure_dashboard_daemon(force=False):
     if _daemon_snapshot_sandboxed():
         return "noop-sandbox"
     # Cheapest gates first -- all pure/stat, no subprocess.
-    if _is_foreign_runtime() or detect_runtime() != "claude":
+    if _is_foreign_runtime() or detect_runtime() not in {'claude', 'codex'}:
         return "noop-foreign"
     if _read_config_flag("daemon_disabled", False):
         return "noop-disabled"
@@ -28092,7 +28110,7 @@ def _daemon_midsession_pulse():
         # disabled/uninstalled/thrashing daemon must NEVER be revived, not even on
         # the 59/60 throttled turns. All are cheap (a stat + a small config read +
         # platform.system()); detect_runtime is paid by quality-cache regardless.
-        if _is_foreign_runtime() or detect_runtime() != "claude":
+        if _is_foreign_runtime() or detect_runtime() not in {'claude', 'codex'}:
             return "noop-foreign"
         # Filesystem tombstone is AUTHORITATIVE and independent of config.json: a
         # corrupt config would make `daemon_disabled` read False and defeat the
@@ -28970,6 +28988,8 @@ def sanitize_session_id(sid):
     if not sid:
         return "unknown"
     sanitized = re.sub(r"[^a-zA-Z0-9_-]", "", sid)
+    if detect_runtime() == 'codex':
+        sanitized = codex_session._safe_session_id(sanitized)
     return sanitized if len(sanitized) >= 6 else "unknown"
 
 
@@ -29831,8 +29851,7 @@ def _find_current_session_jsonl():
             current_tid = None
         if current_tid:
             resolved = codex_session.find_session_jsonl_by_id(current_tid)
-            if resolved:
-                return resolved
+            return resolved
         return codex_session.find_current_session_jsonl()
 
     # Hermes: no ~/.claude/projects JSONL to scan (sessions live in state.db).
@@ -32722,7 +32741,11 @@ def compact_capture(transcript_path=None, session_id=None, trigger="auto", cwd=N
     ts = now.strftime("%Y-%m-%dT%H:%M:%S%z")
     ts_file = now.strftime("%Y%m%d-%H%M%S")
 
-    if transcript_path:
+    if detect_runtime() == 'codex' and session_id:
+        filepath = codex_session.resolve_session(transcript_path, session_id)
+        if not filepath:
+            return None
+    elif transcript_path:
         filepath = Path(transcript_path)
     else:
         # Identity before inference. _find_current_session_jsonl() returns the
@@ -33625,7 +33648,7 @@ def compact_restore(session_id=None, cwd=None, is_compact=False, new_session_onl
         # one-time stderr warning so a format change is visible at dev time,
         # and (b) keep the cross-session label even without the sid, so the
         # fallback never silently reverts to the old unlabeled pointer.
-        src_sid_match = re.match(r'^([0-9a-fA-F-]{8,36})-\d{8}-\d{6}-', latest["filename"])
+        src_sid_match = re.search(r'([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})-\d{8}-\d{6}-', latest["filename"])
         src_sid_short = src_sid_match.group(1)[:8] if src_sid_match else None
         if src_sid_short and (not sid_safe or not sid_safe.startswith(src_sid_short)):
             print(f"[Token Optimizer] Cross-session checkpoint ({src_sid_short}){about}: {latest['path']}. "
@@ -37866,7 +37889,11 @@ def quality_cache(throttle_seconds=120, warn_threshold=70, quiet=False, session_
     Returns the quality score, or None if skipped/failed.
     """
     # Resolve the session file: prefer explicit path, fall back to mtime guess
-    if session_jsonl:
+    if detect_runtime() == 'codex' and session_id:
+        filepath = codex_session.resolve_session(session_jsonl, session_id)
+        if not filepath:
+            return None
+    elif session_jsonl:
         filepath = Path(session_jsonl) if Path(session_jsonl).exists() else None
     else:
         # Resolve by identity before falling back to an mtime guess: a wrong
@@ -39266,9 +39293,13 @@ def _get_v5_feature_status():
     codex_hooks_text = ""
     if detect_runtime() == "codex":
         try:
-            codex_hooks_text = (Path.cwd() / ".codex" / "hooks.json").read_text(encoding="utf-8")
+            codex_hooks_text = (codex_home() / 'hooks.json').read_text(encoding='utf-8')
         except OSError:
             codex_hooks_text = ""
+        try:
+            codex_hooks_text += (Path.cwd() / '.codex/hooks.json').read_text(encoding='utf-8')
+        except OSError:
+            pass
     for name, feat in V5_FEATURES.items():
         # Resolve env from the process AND settings.json so the dashboard sees
         # flags a user "marked" even when this process (e.g. the daemon) did not
@@ -39302,7 +39333,7 @@ def _get_v5_feature_status():
         }
         if detect_runtime() == "codex":
             if name in {"quality_nudges", "loop_detection"}:
-                hook_enabled = "UserPromptSubmit" in codex_hooks_text and "codex_hook_bridge.py" in codex_hooks_text
+                hook_enabled = "UserPromptSubmit" in codex_hooks_text and "token-optimizer/scripts" in codex_hooks_text
                 status[name]["enabled"] = hook_enabled
                 status[name]["source"] = "codex hook" if hook_enabled else "codex opt-in"
                 status[name]["managed_by_hooks"] = True
@@ -46411,7 +46442,11 @@ def run_verbosity_steer(transcript_path=None, quiet=True, session_id=None):
         # returns the most recently active transcript, which on a brand-new session
         # is somebody else's -- so a guessed path must clear a higher bar below.
         guessed = False
-        if transcript_path and Path(transcript_path).exists():
+        if detect_runtime() == 'codex' and session_id:
+            filepath = codex_session.resolve_session(transcript_path, session_id)
+            if not filepath:
+                return ''
+        elif transcript_path and Path(transcript_path).exists():
             filepath = Path(transcript_path)
         else:
             filepath = _find_current_session_jsonl()

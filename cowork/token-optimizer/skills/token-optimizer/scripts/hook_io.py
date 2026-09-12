@@ -102,6 +102,15 @@ def read_stdin_hook_input(max_bytes: int = 1_048_576) -> dict:
                 file=sys.stderr,
             )
             return {}
+        from runtime_env import detect_runtime
+        if detect_runtime() == 'codex':
+            import os
+            import codex_session
+            sid = codex_session._safe_session_id(parsed.get('session_id'))
+            if sid:
+                os.environ['TOKEN_OPTIMIZER_SESSION_ID'] = sid
+                resolved = codex_session.resolve_session(parsed.get('transcript_path'), sid)
+                parsed['transcript_path'] = str(resolved) if resolved else None
         return parsed
     except (OSError, json.JSONDecodeError, ValueError):
         pass

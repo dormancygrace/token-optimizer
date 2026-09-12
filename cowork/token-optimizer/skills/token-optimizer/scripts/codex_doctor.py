@@ -31,6 +31,7 @@ REQUIRED_FILES = (
     "hooks/run.py",
     "skills/token-optimizer/scripts/codex_hook_bridge.py",
     "skills/token-optimizer/scripts/codex_session.py",
+    "skills/token-optimizer/scripts/codex_models.py",
     "skills/token-optimizer/scripts/codex_compact_prompt.py",
     "skills/token-optimizer/scripts/codex_statusline.py",
     "skills/token-optimizer/scripts/codex_install.py",
@@ -305,10 +306,12 @@ def _project_hook_check(project: Path) -> dict[str, str]:
 def _project_feature_checks(project: Path) -> list[dict[str, str]]:
     hooks_path = project / ".codex" / "hooks.json"
     data, error = _load_json(hooks_path)
-    if error or not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
-        return []
-
-    hooks = data.get("hooks", {})
+    hooks = data.get('hooks', {}) if isinstance(data, dict) else {}
+    global_data, _ = _load_json(codex_home() / 'hooks.json')
+    if isinstance(global_data, dict) and isinstance(global_data.get('hooks'), dict):
+        for event, groups in global_data['hooks'].items():
+            if isinstance(groups, list):
+                hooks[event] = list(hooks.get(event, [])) + groups
     checks = []
     if _has_project_hook(hooks, "PreToolUse", "Bash", "bash_hook.py"):
         checks.append(_check("OK", "Feature: Bash compression", "enabled for PreToolUse(Bash)"))
@@ -362,7 +365,11 @@ def _has_project_hook(hooks: dict[str, Any], event: str, matcher: str | None, co
             if not isinstance(hook, dict) or hook.get("type") != "command":
                 continue
             command = hook.get("command", "")
-            if isinstance(command, str) and command_needle in command:
+            if not isinstance(command, str):
+                continue
+            bundled = event in ('Stop', 'UserPromptSubmit') and 'token-optimizer/scripts/windows-launcher' in command
+            runner = {'Stop': 'stop_runner.py', 'UserPromptSubmit': 'userpromptsubmit_runner.py'}.get(event)
+            if command_needle in command or bundled or (runner and runner in command):
                 return True
     return False
 

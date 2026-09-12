@@ -52,6 +52,7 @@ def normalize_model_name(model_id: str) -> str | None:
         return "haiku"
     # OpenAI GPT-5 family (most-specific first to prevent prefix shadowing)
     for alias in (
+        "gpt-6-astra",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",

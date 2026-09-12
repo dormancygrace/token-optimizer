@@ -35,14 +35,14 @@ def test_gpt56_normalization_variants(model_id, canonical):
 
 
 def test_gpt56_keeps_the_existing_generic_gpt5_quality_curve():
-    assert measure._quality_curve_for_model("gpt-5.6-sol")[0] == "openai-gpt-5"
+    assert 'uncalibrated' in measure._quality_curve_for_model("gpt-5.6-sol")[0]
     assert measure._quality_curve_for_model("gpt-5.5")[0] == "openai-gpt-5.5"
 
 
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
-        ("gpt-5.6-sol", 2.0875),
+        ("gpt-5.6-sol", 1.47),
         ("gpt-5.6-terra", 0.8350),
         ("gpt-5.6-luna", 0.0835),
     ],
@@ -61,7 +61,7 @@ def test_gpt56_base_cost_includes_cached_and_cache_write_tokens(model, expected)
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
-        ("gpt-5.6-sol", 68.50),
+        ("gpt-5.6-sol", 48.80),
         ("gpt-5.6-terra", 27.40),
         ("gpt-5.6-luna", 2.74),
     ],
@@ -80,10 +80,10 @@ def test_gpt56_long_context_cost_uses_documented_multiplier(model, expected):
 @pytest.mark.parametrize(
     ("model", "rate"),
     [
-        ("openrouter/openai/gpt-5.6-sol-2026-07-09", 5.0),
+        ("openrouter/openai/gpt-5.6-sol-2026-07-09", 4.0),
         ("GPT-5.6 Terra", 2.0),
         ("gpt-5.6_luna", 0.20),
-        ("gpt-5.6", 5.0),
+        ("gpt-5.6", 4.0),
     ],
 )
 def test_hook_savings_uses_gpt56_canonical_input_rates(monkeypatch, model, rate):
@@ -103,7 +103,7 @@ def test_hook_savings_uses_gpt56_canonical_input_rates(monkeypatch, model, rate)
 @pytest.mark.parametrize(
     ("model", "input_rate", "cache_read_rate", "cache_write_rate", "output_rate"),
     [
-        ("gpt-5.6-sol", 5.0, 0.50, 6.25, 30.0),
+        ("gpt-5.6-sol", 4.0, 0.40, 5.0, 20.0),
         ("gpt-5.6-terra", 2.0, 0.20, 2.50, 12.0),
         ("gpt-5.6-luna", 0.20, 0.02, 0.25, 1.20),
     ],

@@ -178,10 +178,11 @@ For Codex specifically, translate all advice to native Codex concepts:
 - `AGENTS.md` instead of `CLAUDE.md`
 - Codex memories instead of `MEMORY.md`
 - balanced Codex hooks instead of Claude hooks
-- Intelligence levels (Low/Medium/High/Extra High) and model selection (GPT-5.6 Sol/Terra/Luna, GPT-5.5, GPT-5.4, GPT-5.4-Mini, GPT-5.3-Codex, GPT-5.2) instead of Opus/Sonnet/Haiku routing
+- Model selection from the installed Codex catalog (`codex-state --json`, `available_models`), including GPT-6 Astra, GPT-5.6 Sol/Terra/Luna, and other account-available models; use their advertised reasoning efforts instead of a hardcoded list
 - Reasoning effort settings instead of model-per-agent routing
 - compact prompt guidance instead of PreCompact/PostCompact lifecycle hooks
 - Never reference Claude-specific concepts (Opus, Sonnet, Haiku, CLAUDE.md) when coaching a Codex user
+- Subscription quota percentages come from logged Codex rate-limit snapshots. Tokens, quality scores, and API-price comparisons do not establish quota savings. Label snapshots with their time and API comparisons separately.
 
 **Tone**: Knowledgeable friend, not corporate consultant. Be direct about what matters and why. Use real numbers from their data.
 

@@ -99,6 +99,64 @@ def test_rollout_nudge_identity_matches_only_its_live_task(measure, tmp_path, mo
     assert not m.run_verbosity_steer(str(transcript), quiet=True,
                                     session_id='11234567-1234-1234-1234-123456789abc')
 
+def test_new_codex_task_never_reads_or_checkpoints_another_task(measure, tmp_path, monkeypatch):
+    other = write_session(tmp_path / 'sessions' / f'rollout-2026-09-06-{SID}.jsonl')
+    missing = '11234567-1234-1234-1234-123456789abc'
+    monkeypatch.setattr(measure, '_find_current_session_jsonl', lambda: other)
+    monkeypatch.setattr(measure, 'CHECKPOINT_DIR', tmp_path / 'checkpoints')
+    assert cs.resolve_session(str(other), missing) is None
+    assert measure.quality_cache(session_jsonl=str(other), session_id=missing) is None
+    assert measure.compact_capture(str(other), missing) is None
+    assert not measure.run_verbosity_steer(str(other), session_id=missing)
+    assert not list((tmp_path / 'checkpoints').glob('*.md'))
+
+def test_live_identity_overrides_latest_database_task(measure, monkeypatch):
+    import codex_state
+    monkeypatch.setattr(codex_state, '_is_codex', lambda: True)
+    monkeypatch.setenv('TOKEN_OPTIMIZER_SESSION_ID', SID)
+    monkeypatch.setattr(codex_state, '_find_versioned_db', lambda *a: pytest.fail('must not choose another database task'))
+    assert codex_state.current_thread_id() == SID
+    assert measure.sanitize_session_id(f'rollout-2026-09-06-{SID}') == SID
+
+def test_client_model_catalog_limits_and_visibility(measure, monkeypatch, tmp_path):
+    import codex_models as models
+    monkeypatch.setattr(models, 'codex_home', lambda: tmp_path)
+    records = [{'slug': 'gpt-6-astra', 'context_window': 272000,
+                'effective_context_window_percent': 95, 'visibility': 'list'},
+               {'slug': 'gpt-5.3-codex-spark', 'context_window': 128000,
+                'effective_context_window_percent': 95, 'visibility': 'list'},
+               {'slug': 'codex-auto-review', 'context_window': 272000, 'visibility': 'hide'}]
+    path = tmp_path / 'models_cache.json'
+    path.write_text(json.dumps({'models': records}))
+    assert models.effective_window('gpt-6-astra') == 258400
+    assert models.effective_window('gpt-5.3-codex-spark') == 121600
+    assert len(models.visible_models()) == 2
+    records[0]['context_window'] = 400000
+    path.write_text(json.dumps({'models': records}))
+    assert models.effective_window('gpt-6-astra') == 380000
+    assert models.effective_window('unknown') is None
+
+def test_codex_global_consolidated_hooks_are_recognized(measure, monkeypatch, tmp_path):
+    import codex_doctor as doctor
+    monkeypatch.setattr(doctor, 'codex_home', lambda: tmp_path)
+    hook = {'hooks': [{'type': 'command', 'command': 'python -c encoded token-optimizer/scripts/windows-launcher'}]}
+    (tmp_path / 'hooks.json').write_text(json.dumps({'hooks': {'Stop': [hook], 'UserPromptSubmit': [hook]}}))
+    checks = {c['name']: c['status'] for c in doctor._project_feature_checks(tmp_path / 'project')}
+    assert checks['Feature: Session continuity and dashboard refresh'] == 'OK'
+    assert checks['Optional feature: Prompt quality nudges'] == 'OK'
+    monkeypatch.setattr(measure, 'codex_home', lambda: tmp_path)
+    assert measure._collect_codex_hook_status_for_dashboard()['codex_balanced_profile']['installed']
+
+def test_codex_daemon_uses_native_lifecycle(measure, monkeypatch):
+    m = measure
+    monkeypatch.setattr(m, '_daemon_snapshot_sandboxed', lambda: False)
+    monkeypatch.setattr(m, '_read_config_flag', lambda key, default=None: default)
+    monkeypatch.setattr(m, '_daemon_install_failed_marker_present', lambda: False)
+    monkeypatch.setattr(m, '_normalized_platform', lambda: 'Windows')
+    monkeypatch.setattr(m, '_daemon_service_installed', lambda system: True)
+    monkeypatch.setattr(m, '_verify_daemon_port', lambda **kw: True)
+    assert m._ensure_dashboard_daemon() == 'noop-healthy'
+
 def test_compact_prompt_is_root_key_and_preserves_tables():
     original = 'model = "gpt-5.4"\n[plugins.example]\nenabled = true\n'
     updated, _ = cp._replace_or_append_config(original, Path('/prompt.md'), force=False)

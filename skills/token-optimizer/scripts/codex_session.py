@@ -222,7 +222,22 @@ def _safe_session_id(value: str | None) -> str:
     if not value:
         return ""
     sanitized = re.sub(r"[^a-zA-Z0-9_-]", "", value)
+    match = re.fullmatch(r'rollout-.*-([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})', sanitized)
+    if match:
+        return match.group(1)
     return sanitized if len(sanitized) >= 6 else ""
+
+
+def resolve_session(transcript_path=None, session_id=None):
+    """Resolve a known task without ever substituting another active task."""
+    sid = _safe_session_id(session_id)
+    if transcript_path:
+        p = Path(transcript_path)
+        if p.is_file() and (not sid or _safe_session_id(p.stem) == sid or _session_meta_id(p) == sid):
+            return p
+    if sid:
+        return find_session_jsonl_by_id(sid)
+    return None
 
 
 def _looks_like_error_text(text: str) -> bool:
@@ -278,7 +293,7 @@ def find_session_jsonl_by_id(session_id: str) -> Path | None:
             continue
         for jf in itertools.islice(root.rglob(f"*{safe_id}*.jsonl"), 50):
             meta_id = _session_meta_id(jf)
-            if jf.stem == safe_id or safe_id in jf.stem or meta_id == safe_id or (meta_id and meta_id.startswith(safe_id)):
+            if _safe_session_id(jf.stem) == safe_id or meta_id == safe_id:
                 exact_matches.append(jf)
     if not exact_matches:
         return None
