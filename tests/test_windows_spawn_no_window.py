@@ -318,9 +318,11 @@ def test_session_end_flush_posix_uses_start_new_session(m, monkeypatch):
 def test_daemon_revive_nt_uses_creationflags(m, monkeypatch):
     """The daemon-revive spawn must route through spawn_detached on nt."""
     monkeypatch.setattr(m, "_verify_daemon_port", lambda **k: False)  # dead
+    monkeypatch.setattr(m, "_daemon_service_installed", lambda system: False)
     monkeypatch.setattr(m, "_normalized_platform", lambda: "Windows")
     _set_nt_spawn_utils(monkeypatch)
     cap = _capture_spawn_detached_popen(monkeypatch)
+    monkeypatch.setattr(m, "_daemon_snapshot_sandboxed", lambda: False)
     assert m._daemon_midsession_pulse() == "revive-spawned"
     assert "creationflags" in cap
     assert cap["creationflags"] == _DETACH_FLAGS
@@ -330,8 +332,10 @@ def test_daemon_revive_nt_uses_creationflags(m, monkeypatch):
 @pytest.mark.skipif(sys.platform == "win32", reason="asserts POSIX spawn behavior (start_new_session, no creationflags); the NT variant covers Windows")
 def test_daemon_revive_posix_uses_start_new_session(m, monkeypatch):
     monkeypatch.setattr(m, "_verify_daemon_port", lambda **k: False)
+    monkeypatch.setattr(m, "_daemon_service_installed", lambda system: False)
     _set_posix_spawn_utils(monkeypatch)
     cap = _capture_spawn_detached_popen(monkeypatch)
+    monkeypatch.setattr(m, "_daemon_snapshot_sandboxed", lambda: False)
     assert m._daemon_midsession_pulse() == "revive-spawned"
     assert cap.get("start_new_session") is True
     assert "creationflags" not in cap

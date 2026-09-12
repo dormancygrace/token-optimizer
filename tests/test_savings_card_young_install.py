@@ -233,6 +233,8 @@ def test_template_has_young_install_guard():
     assert "trackedDays >= 30" in body, "exactly-30 must stay run-rate ('/mo')"
     # Both framings exist and are selected by the guard, never hardcoded.
     assert "runRate ? '/mo' : ' so far'" in body
-    assert "Saved so far" in body
-    # Young-install hero is measured-only: it equals the right card's headline.
-    assert "runRate ? gettingMo : measuredMo" in body
+    assert "days tracked" in body
+    # The new action summary labels its estimated portions at every install age.
+    # It shows cumulative value without projecting a partial sample to a month.
+    assert "logged + estimated" in body
+    assert "var heroAmt = gettingMo" in body

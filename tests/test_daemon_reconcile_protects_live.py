@@ -169,6 +169,9 @@ def test_setup_daemon_uninstall_still_removes_plist(tmp_path, monkeypatch):
     # No port reclaim / process killing in the test host.
     monkeypatch.setattr(mod, "_reclaim_daemon_ports", lambda *a, **k: None)
     monkeypatch.setattr(mod, "_reclaim_posix_daemon_port", lambda *a, **k: None)
+    # All launchd paths/process calls are isolated above; bypass only to test
+    # the low-level removal semantics themselves.
+    monkeypatch.setattr(mod, "_daemon_snapshot_sandboxed", lambda: False)
     # Plant a per-identity daemon file so the sweep has something to remove.
     (Path(snap) / "dashboard-server.py").write_text("# daemon", encoding="utf-8")
     (Path(snap) / "daemon-token").write_text("tok", encoding="utf-8")

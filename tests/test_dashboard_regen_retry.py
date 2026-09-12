@@ -13,14 +13,17 @@ POST exactly once; if it still fails, surface a prominent inline error instead
 of a tiny span. If the token is empty at click time, lazy-fetch it before the
 first POST (that is a prerequisite, not a retry).
 
-There is no JS runtime in this repo's test harness, so these tests assert the
-contract against the shipped JS source text -- the same approach
-test_runway_card_wiring.py takes for the runway card. They fail at edit time if
-the retry wiring is removed or weakened, which is the regression that matters.
+Source-contract checks cover the wiring; Node executes the shipped handler to
+verify success, retries, duplicate clicks, and recoverable failures.
 """
 
 import re
+import json
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "skills" / "token-optimizer" / "assets"
@@ -146,3 +149,51 @@ def test_regen_contract_mirrored_to_plugin_tree():
         / "dashboard.html"
     ).read_text(encoding="utf-8")
     assert a == b, "dashboard.html drifted between the two install trees"
+
+
+@pytest.mark.parametrize("scenario,posts,fetches,reloads", [
+    ("success", 1, 0, 1),
+    ("empty", 1, 1, 1),
+    ("stale", 2, 1, 1),
+    ("denied", 2, 1, 0),
+    ("network", 1, 0, 0),
+    ("bad_json", 1, 0, 0),
+    ("server_failure", 1, 0, 0),
+])
+def test_regenerate_click_behavior(scenario, posts, fetches, reloads):
+    """Execute the shipped click handler, including retries and duplicate clicks."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for browser-handler execution")
+    handler = _regen_body((ASSETS / "dashboard.html").read_text(encoding="utf-8"))
+    setup = r'''
+const scenario = process.argv[2];
+const counts = {posts: 0, fetches: 0, reloads: 0};
+const btn = {disabled: false, textContent: 'Regenerate savings'};
+const msg = {textContent: ''};
+const error = {hidden: true, textContent: ''};
+const document = {getElementById: id => ({'to-regen-btn': btn, 'to-regen-msg': msg, 'to-regen-error': error}[id])};
+const location = {reload: () => counts.reloads++};
+const window = {__TOKEN_API_TOKEN: scenario === 'empty' ? '' : 'initial'};
+function _fetchToken() { counts.fetches++; window.__TOKEN_API_TOKEN = 'fresh'; return Promise.resolve(); }
+window.__TOKEN_API_POST = async function(path) {
+  if (path !== '/api/regenerate') throw Error('wrong endpoint');
+  counts.posts++;
+  if (scenario === 'denied' || (scenario === 'stale' && counts.posts === 1)) throw {authError: true};
+  if (scenario === 'network') throw Error('network unavailable');
+  return {json: () => scenario === 'bad_json' ? Promise.reject(Error('invalid JSON')) : Promise.resolve({ok: scenario !== 'server_failure', msg: 'generation failed'})};
+};
+'''
+    check = r'''
+window.__TOKEN_REGENERATE();
+window.__TOKEN_REGENERATE(); // A second click while pending must do nothing.
+setImmediate(() => process.stdout.write(JSON.stringify({counts, btn, error})));
+'''
+    result = subprocess.run([node, "-", scenario], input=setup + handler + check,
+                            capture_output=True, text=True, check=True, timeout=10)
+    state = json.loads(result.stdout)
+    assert state["counts"] == {"posts": posts, "fetches": fetches, "reloads": reloads}
+    if not reloads:
+        assert state["btn"] == {"disabled": False, "textContent": "Regenerate savings"}
+        assert state["error"]["hidden"] is False
+        assert state["error"]["textContent"]

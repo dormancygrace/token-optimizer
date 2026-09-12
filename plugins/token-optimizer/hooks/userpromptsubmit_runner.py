@@ -188,23 +188,19 @@ def _read_hook_input() -> dict:
 
 
 def _harness_only_context() -> bool:
-    """Replicate the shell harness guard that gated hooks.json entries 4/5/6.
-
-    Original shell::
-
-        [ -n "$CLAUDE_CODE_CONTAINER_ID$CLAUDE_CODE_REMOTE" ] ||
-        case "$AI_AGENT$CLAUDE_PLUGIN_ROOT" in *harness*|*/plugins/synced/*) ;; *) exit 0;; esac
-
-    i.e. run the harness-only subcommands when EITHER a container/remote env is
-    set OR the combined AI_AGENT+CLAUDE_PLUGIN_ROOT string contains "harness" or
-    "/plugins/synced/". Byte-identical to the shell semantics.
-    """
+    """Require remote/container evidence or Codex, not an ambiguous harness tag."""
     container_id = os.environ.get("CLAUDE_CODE_CONTAINER_ID", "").strip()
-    remote = os.environ.get("CLAUDE_CODE_REMOTE", "").strip()
+    # Align with runtime_env._truthy_env, which accepts 1/true/yes/on
+    # (case-insensitive). false/0/off/empty stay False. Do NOT treat a generic
+    # AI_AGENT=claude-code_*_harness tag as harness evidence (Cowork is gated
+    # by detect_runtime() == "codex" below, not by the harness tag).
+    remote = os.environ.get("CLAUDE_CODE_REMOTE", "").strip().lower() in {"1", "true", "yes", "on"}
     if container_id or remote:
         return True
-    combined = os.environ.get("AI_AGENT", "") + os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-    return ("harness" in combined) or ("/plugins/synced/" in combined)
+    for name in ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA"):
+        if "/plugins/synced/" in os.environ.get(name, "").replace("\\", "/"):
+            return True
+    return measure.detect_runtime() == "codex"
 
 
 def _quality_cache_is_missing(hook_input: dict) -> bool:
@@ -530,7 +526,8 @@ def _sub_compact_restore(hook_input: dict) -> None:
         with redirect_stdout(buf):
             measure.compact_restore(session_id=sid, new_session_only=True)
         measure._emit_additional_context(
-            buf.getvalue(), event="UserPromptSubmit" if _cw else "SessionStart"
+            # This runner only handles UserPromptSubmit, regardless of runtime.
+            buf.getvalue(), event="UserPromptSubmit"
         )
     else:
         measure.compact_restore(session_id=sid, new_session_only=True)

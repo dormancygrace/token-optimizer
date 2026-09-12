@@ -46,6 +46,8 @@ def m(monkeypatch):
     if "measure" in sys.modules:
         del sys.modules["measure"]
     mod = importlib.import_module("measure")
+    # This file replaces every daemon spawn before exercising orchestration.
+    monkeypatch.setattr(mod, "_daemon_snapshot_sandboxed", lambda: False)
     monkeypatch.setattr(mod, "_is_foreign_runtime", lambda: False)
     monkeypatch.setattr(mod, "detect_runtime", lambda: "claude")
     monkeypatch.setattr(mod, "_normalized_platform", lambda: "Darwin")

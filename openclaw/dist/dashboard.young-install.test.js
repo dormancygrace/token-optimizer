@@ -57,6 +57,7 @@ const baseData = {
         totalRuns: 0,
         totalCost: 0,
         totalTokens: 0,
+        totalBillableTokens: 0,
         allCostZero: true,
         monthlySavings: 0,
         wasteCount: 0,
@@ -77,6 +78,8 @@ const baseData = {
     coach: null,
     savings: null,
     savingsEvents: { categories: [], totalTokensSaved: 0, totalCostSavedUsd: 0, totalCount: 0 },
+    coreVersion: "5.13.10",
+    adapterVersion: "2.4.21",
 };
 function render(overrides) {
     const html = (0, dashboard_js_1.generateDashboardHtml)({ ...baseData, savings: savings(overrides) });

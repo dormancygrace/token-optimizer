@@ -178,8 +178,8 @@ def test_main_claude_insert_includes_platform():
     collect_end = src.index("\ndef ", collect_start + 1)
     collect_section = src[collect_start:collect_end]
 
-    # Find the INSERT OR IGNORE INTO session_log in the main collector
-    assert "INSERT OR IGNORE INTO session_log" in collect_section, (
+    # Find the INSERT INTO session_log in the main collector
+    assert "INSERT INTO session_log" in collect_section, (
         "main collector must have an INSERT into session_log"
     )
     # The INSERT must include platform as a column

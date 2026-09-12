@@ -80,6 +80,8 @@ const baseData: DashboardData = {
   coach: null,
   savings: null,
   savingsEvents: { categories: [], totalTokensSaved: 0, totalCostSavedUsd: 0, totalCount: 0 },
+  coreVersion: "5.13.10",
+  adapterVersion: "2.4.21",
 };
 
 function render(overrides: Partial<RealizedSavings>): string {

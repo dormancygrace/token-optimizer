@@ -438,6 +438,17 @@ else:
     SNAPSHOT_DIR = RUNTIME_DIR / "_backups" / "token-optimizer"
     _CONFIG_BASE = None  # resolved below after constants
 
+
+def _daemon_snapshot_sandboxed():
+    """True when session data was explicitly redirected for tests/sandboxes.
+
+    A sandbox snapshot must never mutate the machine-wide daemon identity.
+    The value is frozen with SNAPSHOT_DIR at import so later environment drift
+    cannot separate the guard from the paths it protects.
+    """
+    return bool(_SNAPSHOT_DIR_OVERRIDE)
+
+
 # Cowork dual-write: the per-session state dirs -- QUALITY_CACHE_DIR
 # (quality-cache-*.json, resumable-*.json, run-once markers) and CHECKPOINT_DIR
 # -- default to RUNTIME_DIR (~/.claude/token-optimizer). But SNAPSHOT_DIR
@@ -9781,7 +9792,7 @@ def _osrc_prompt_text(record):
     return ""
 
 
-def _parse_session_jsonl(filepath):
+def _parse_session_jsonl(filepath, window_start=None, window_end=None):
     """Parse a single JSONL session file in one streaming pass.
 
     Returns a dict with extracted session metrics, or None if the file
@@ -9792,13 +9803,15 @@ def _parse_session_jsonl(filepath):
     # Memoization: skip re-parse if the file hasn't changed since we last saw it.
     try:
         st = os.stat(filepath)
-        cache_key = (str(filepath), st.st_mtime_ns, st.st_size)
+        cache_key = (str(filepath), st.st_mtime_ns, st.st_size, window_start, window_end)
         if cache_key in _parse_session_jsonl_cache:
             return _parse_session_jsonl_cache[cache_key]
     except OSError:
         cache_key = None  # stat failed — parse without caching
 
     if _use_codex_session_adapter(filepath):
+        if window_start is not None or window_end is not None:
+            return None  # This adapter does not yet support activity slicing.
         result = codex_session.parse_session_jsonl(filepath)
         if cache_key is not None:
             if len(_parse_session_jsonl_cache) >= _PARSE_CACHE_MAX:
@@ -9888,6 +9901,21 @@ def _parse_session_jsonl(filepath):
                     s = record.get("slug")
                     if s:
                         slug = s
+
+                # Window reports must slice activity, including sessions that began
+                # before reset. Classify sidechains before filtering their records.
+                if window_start is not None or window_end is not None:
+                    try:
+                        activity_ts = datetime.fromisoformat(
+                            str(record.get("timestamp")).replace("Z", "+00:00"))
+                        if activity_ts.tzinfo is None:
+                            activity_ts = activity_ts.replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        continue
+                    if window_start is not None and activity_ts < window_start:
+                        continue
+                    if window_end is not None and activity_ts >= window_end:
+                        continue
 
                 # Extract timestamp
                 ts_str = record.get("timestamp")
@@ -18054,6 +18082,7 @@ _COUNTED_SE_EVENT_TYPES = (
 _COUNTED_CE_EXCLUDED_FEATURES = (
     "quality_nudge", "loop_detection", "cohort_demoted", "fresh_session_nudge",
     "cache_drop_warning", "first_read_edit_followup",
+    "delta_read",  # read_cache emits both ledgers; savings_events owns this key
 )
 # Ledger events count from here; earlier months use transcript markers instead
 # (the Mar-Apr ledger logged 4+13 events against 73+232 physical markers).
@@ -18075,7 +18104,7 @@ def _counted_event_utc(ts):
     timestamps are UTC. Convert local-naive -> UTC-naive (DST-correct for the
     event's own date via the system tz database). Never raises."""
     try:
-        dt = datetime.fromisoformat(str(ts)[:26])
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         return dt.astimezone(timezone.utc).replace(tzinfo=None)
     except (ValueError, TypeError, OSError):
         return None
@@ -18295,6 +18324,14 @@ def _update_counted_cumulative(conn, max_sessions=_COUNTED_MAX_SESSIONS_PER_PASS
              "unmeasured_events": 0}
     try:
         started = time.monotonic()
+        # Earlier versions compounded the delta_read mirror as a second removal.
+        # Delete only those derived duplicates; keep both source telemetry rows.
+        duplicates = conn.execute(
+            "DELETE FROM counted_reread WHERE event_key IN "
+            "(SELECT 'ce:'||id FROM compression_events WHERE feature='delta_read')")
+        stats["duplicate_rows_removed"] = max(0, duplicates.rowcount)
+        if duplicates.rowcount:
+            conn.commit()
         events = _counted_candidate_events(conn)
         if not events:
             return stats
@@ -18460,10 +18497,15 @@ def _counted_marker_backfill(conn, max_files=_COUNTED_MARKER_FILES_PER_PASS,
 
 
 def _purge_counted_without_transcripts(conn):
-    """Remove counted rows that have no real transcript to support them."""
+    """Remove never-verified fallback rows, preserving evidence already counted.
+
+    Transcript rotation must not erase stored savings. A recorded mtime proves
+    the row was computed from a real transcript, even if that file is now gone.
+    """
     try:
         rows = conn.execute(
-            "SELECT rowid, session_uuid FROM counted_reread"
+            "SELECT rowid, session_uuid FROM counted_reread "
+            "WHERE transcript_mtime IS NULL AND COALESCE(source, '') <> 'mk'"
         ).fetchall()
     except sqlite3.Error:
         return 0
@@ -18497,26 +18539,49 @@ def _counted_backfill_all(conn, quiet=True):
     return stats
 
 
-def _counted_cumulative_summary():
+def _counted_cumulative_summary(days=None, now=None):
     """Cheap SELECT-only rollup of counted_reread for the Counted-to-date card.
 
     NEVER walks transcripts (the collect pass owns that); a dashboard regen
-    pays one aggregate query. Fail-open to {"available": False}."""
+    pays aggregate queries only. With days, select removals made in that period;
+    their later rereads stay attributed to the removal (not to the reread date).
+    This is an event cohort, not a claim of dollars accrued inside an exact window.
+    Fail-open to {"available": False}."""
     out = {"available": False}
+    if days is not None and detect_runtime() != "claude":
+        return out
     if not TRENDS_DB.exists():
         return out
     try:
+        where, params = "", ()
+        end = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        start = end - timedelta(days=max(1, int(days))) if days is not None else None
         conn = _init_trends_db()
         try:
+            if start is not None:
+                def event_epoch(ts, source):
+                    # Pre-ledger marker timestamps were stored as UTC-naive;
+                    # hook events are local-naive, or explicitly offset-aware.
+                    if source == "mk":
+                        try:
+                            value = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                            return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
+                        except (ValueError, TypeError, OSError):
+                            return None
+                    value = _counted_event_utc(ts)
+                    return value.replace(tzinfo=timezone.utc).timestamp() if value else None
+                conn.create_function("counted_event_epoch", 2, event_epoch)
+                where = " WHERE counted_event_epoch(event_ts, source) >= ? AND counted_event_epoch(event_ts, source) <= ?"
+                params = (start.timestamp(), end.timestamp())
             row = conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(tokens),0), "
                 "COALESCE(SUM(oneshot_usd),0), COALESCE(SUM(reread_tokens),0), "
                 "COALESCE(SUM(reread_usd),0), MIN(event_month), MAX(computed_at) "
-                "FROM counted_reread").fetchone()
+                "FROM counted_reread" + where, params).fetchone()
             months = conn.execute(
                 "SELECT event_month, ROUND(COALESCE(SUM(oneshot_usd),0) + "
                 "COALESCE(SUM(reread_usd),0), 2) FROM counted_reread "
-                "GROUP BY event_month ORDER BY event_month").fetchall()
+                + where + " GROUP BY event_month ORDER BY event_month", params).fetchall()
             try:
                 done = conn.execute(
                     "SELECT value FROM token_optimizer_meta WHERE key = ?",
@@ -18528,11 +18593,14 @@ def _counted_cumulative_summary():
         finally:
             conn.close()
         n, tok, oneshot, rr_tok, rr_usd, first_month, computed_at = row
-        if not n:
+        if not n and days is None:
             return out
         return {
             "available": True,
             "events": int(n),
+            "attribution": "removal_time",
+            "period_start": start.isoformat() if start else None,
+            "period_end": end.isoformat(),
             "removed_tokens": int(tok),
             "oneshot_usd": round(float(oneshot), 2),
             "reread_tokens": int(rr_tok),
@@ -18585,6 +18653,10 @@ def _dashboard_savings_data(days=30, include_billing_mode=False, fail_open=False
         savings_data["counted_cumulative"] = _counted_cumulative_summary()
     except Exception:
         savings_data["counted_cumulative"] = {"available": False}
+    try:
+        savings_data["counted_period"] = _counted_cumulative_summary(days=days)
+    except Exception:
+        savings_data["counted_period"] = {"available": False}
     if include_billing_mode:
         try:
             savings_data["billing_mode"] = keepwarm_billing_mode()
@@ -18790,13 +18862,23 @@ def _get_savings_summary(days=30, since=None):
         }
 
 
-def _is_file_collected(conn, jsonl_path):
-    """Check if a JSONL file has already been collected."""
-    cur = conn.execute(
-        "SELECT 1 FROM session_log WHERE jsonl_path = ?",
+def _is_file_collected(conn, jsonl_path, check_mtime=False):
+    """Check stored IDs; file collectors also check delegated transcript changes."""
+    row = conn.execute(
+        "SELECT collected_at FROM session_log WHERE jsonl_path = ?",
         (str(jsonl_path),),
-    )
-    return cur.fetchone() is not None
+    ).fetchone()
+    if row is None:
+        return False
+    if not check_mtime:
+        return True  # Other adapters use synthetic IDs, not filesystem paths.
+    try:
+        collected = datetime.fromisoformat(row[0]).timestamp()
+        path = Path(jsonl_path)
+        paths = [path, *_find_subagent_jsonl_files(path)]
+        return all(path.stat().st_mtime <= collected for path in paths)
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def _insert_normalized_session(conn, dedup_key, parsed, platform, project_fallback, quiet=False):
@@ -20288,7 +20370,7 @@ def _collect_antigravity_sessions(days=90, quiet=False, rebuild=False):
 def collect_sessions(days=90, quiet=False, rebuild=False):
     """Parse new JSONL files and insert into SQLite. Zero token cost.
 
-    Skips files already collected. Safe to run repeatedly.
+    Refreshes changed files in place. Safe to run repeatedly.
     With rebuild=True, drops and re-collects all data (e.g., after a
     measurement fix such as model attribution).
     """
@@ -20308,6 +20390,12 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
         return _collect_grok_sessions(days=days, quiet=quiet, rebuild=rebuild)
 
     conn = _init_trends_db()
+
+    # Capture the existing comparison before refreshing historical session rows.
+    # The user's baseline must not move as collection catches up.
+    if not rebuild and not (SNAPSHOT_DIR / "workload_anchor.json").exists():
+        _session_weight_pool_savings(
+            (datetime.now() - timedelta(days=30)).date().isoformat())
 
     # One-time migration for the model attribution fix: wipe model_daily (safe, fast, no data loss)
     if _needs_model_daily_rebuild(conn):
@@ -20341,17 +20429,8 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
 
     new_count = 0
     for filepath, mtime, project_name in files:
-        refresh_codex = False
-        if _is_file_collected(conn, filepath):
-            if _use_codex_session_adapter(filepath):
-                row = conn.execute('SELECT collected_at FROM session_log WHERE jsonl_path = ?',
-                                   (str(filepath),)).fetchone()
-                try:
-                    refresh_codex = not row[0] or mtime > datetime.fromisoformat(row[0]).timestamp()
-                except (ValueError, TypeError):
-                    refresh_codex = True
-            if not refresh_codex:
-                continue
+        if _is_file_collected(conn, filepath, check_mtime=True):
+            continue
 
         # Bounded per-run collection: never parse more than _COLLECT_MAX_PER_RUN new
         # sessions in one flush. `files` is newest-first, so recent sessions are always
@@ -20360,7 +20439,9 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
         if _COLLECT_MAX_PER_RUN and not rebuild and new_count >= _COLLECT_MAX_PER_RUN:
             break
 
-        parsed = _parse_session_jsonl(filepath)
+        collection_started = datetime.now().isoformat()
+        # Rollups must not mutate the parser cache when only a child grows.
+        parsed = copy.deepcopy(_parse_session_jsonl(filepath))
         if not parsed:
             continue
 
@@ -20424,13 +20505,8 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
         session_platform = parsed.get("runtime") or detect_runtime()
 
         # Insert session_log
-        if refresh_codex:
-            # Only replace after parsing succeeds, in the same transaction as
-            # insertion and aggregate rebuild. Resumed tasks otherwise freeze
-            # forever at the first collection's counters.
-            conn.execute('DELETE FROM session_log WHERE jsonl_path = ?', (str(filepath),))
         cur = conn.execute(
-            """INSERT OR IGNORE INTO session_log
+            """INSERT INTO session_log
                (jsonl_path, date, project, duration_minutes, input_tokens,
                 output_tokens, message_count, api_calls, cache_hit_rate,
                 cache_create_1h_tokens, cache_create_5m_tokens, cache_ttl_scanned,
@@ -20440,7 +20516,42 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
                     quality_score, quality_grade, stale_waste_tokens, is_sidechain,
                     sidechain_reason, reported_input_tokens, reported_output_tokens,
                     reported_model_usage_json, platform)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(jsonl_path) DO UPDATE SET
+               project=excluded.project,
+               duration_minutes=excluded.duration_minutes,
+               input_tokens=excluded.input_tokens,
+               output_tokens=excluded.output_tokens,
+               message_count=excluded.message_count,
+               api_calls=excluded.api_calls,
+               cache_hit_rate=excluded.cache_hit_rate,
+               cache_create_1h_tokens=excluded.cache_create_1h_tokens,
+               cache_create_5m_tokens=excluded.cache_create_5m_tokens,
+               cache_ttl_scanned=excluded.cache_ttl_scanned,
+               avg_call_gap_seconds=excluded.avg_call_gap_seconds,
+               max_call_gap_seconds=excluded.max_call_gap_seconds,
+               p95_call_gap_seconds=excluded.p95_call_gap_seconds,
+               skills_json=excluded.skills_json,
+               subagents_json=excluded.subagents_json,
+               tool_calls_json=excluded.tool_calls_json,
+               model_usage_json=excluded.model_usage_json,
+               all_model_usage_json=excluded.all_model_usage_json,
+               model_usage_breakdown_json=excluded.model_usage_breakdown_json,
+               version=excluded.version,
+               slug=excluded.slug,
+               topic=excluded.topic,
+               collected_at=excluded.collected_at,
+               quality_score=excluded.quality_score,
+               quality_grade=excluded.quality_grade,
+               stale_waste_tokens=excluded.stale_waste_tokens,
+               is_sidechain=excluded.is_sidechain,
+               sidechain_reason=excluded.sidechain_reason,
+               reported_input_tokens=excluded.reported_input_tokens,
+               reported_output_tokens=excluded.reported_output_tokens,
+               reported_model_usage_json=excluded.reported_model_usage_json,
+               platform=excluded.platform
+               WHERE session_log.collected_at IS NULL
+                  OR excluded.collected_at >= session_log.collected_at""",
             (
                 str(filepath), date, project_name,
                 parsed["duration_minutes"],
@@ -20464,7 +20575,7 @@ def collect_sessions(days=90, quiet=False, rebuild=False):
                 parsed["version"],
                 parsed.get("slug"),
                 parsed.get("topic"),
-                datetime.now().isoformat(),
+                collection_started,
                 sq["score"],
                 sq["grade"],
                 int(stale_waste or 0),
@@ -25802,6 +25913,9 @@ def _install_launchd_daemon(dry_run=False, soft_fail=False, effective_host=None)
     overwrites the plist idempotently and bootouts any existing instance
     first so we never fight a stale PID.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     def _fail(msg, hint=None):
         # Under soft_fail we are inside a hook --
         # stdout is session-visible context, so route errors to stderr instead
@@ -26133,6 +26247,9 @@ def _uninstall_launchd_daemon(this_install_only=False, dry_run=False):
     side-effect-free (no bootout, no file deletion, no tombstone write) so the
     cleanup command's ``--dry-run`` is a true preview.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     if dry_run:
         # Dry-run: report what WOULD be removed, touch nothing.
         would_remove = []
@@ -26564,6 +26681,9 @@ def _install_task_scheduler_daemon(dry_run=False, soft_fail=False, effective_hos
     Windows user to run this is the de facto smoke test. Full rollback
     is one command: `measure.py setup-daemon --uninstall`.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     def _fail(msg, *extra, permanent_reason=None):
         # Only DEFINITIVE, permanent failure classes
         # arm the sticky no-retry marker (MS-Store alias, schtasks missing,
@@ -26767,6 +26887,9 @@ def _uninstall_task_scheduler_daemon(this_install_only=False, dry_run=False):
     side-effect-free (no schtasks calls, no file deletion, no tombstone write)
     so the cleanup command's ``--dry-run`` is a true preview.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     if dry_run:
         would_remove = []
         per_identity: list[tuple[Path, list[str]]] = []
@@ -26995,6 +27118,9 @@ def _install_systemd_user_daemon(dry_run=False, soft_fail=False, effective_host=
     and kill the calling Claude Code session. Returns True on success. CLI
     callers keep the default False for the hard-failure + actionable-hint UX.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     def _fail(msg, *extra):
         # Under soft_fail we are inside a hook --
         # stdout is session-visible context, so route errors to stderr instead
@@ -27165,6 +27291,9 @@ def _uninstall_systemd_user_daemon(this_install_only=False, dry_run=False):
     side-effect-free (no systemctl calls, no file deletion, no tombstone write)
     so the cleanup command's ``--dry-run`` is a true preview.
     """
+    if _daemon_snapshot_sandboxed():
+        return False
+
     if dry_run:
         would_remove = []
         per_identity: list[tuple[Path, list[str]]] = []
@@ -27295,6 +27424,8 @@ def setup_daemon(dry_run=False, uninstall=False, this_install_only=False, latch_
     clean only the resolved identity, for a user intentionally running
     side-by-side installs who only wants this one gone.
     """
+    if _daemon_snapshot_sandboxed():
+        return "noop-sandbox"
     system = _normalized_platform()
     if uninstall:
         if system == "Darwin":
@@ -27763,6 +27894,10 @@ def _ensure_dashboard_daemon(force=False):
     ('restart-stale' propagates up from _restart_dashboard_daemon's
     landing-verification.) Never raises.
     """
+    # An explicit snapshot override is an isolation boundary, including when a
+    # detached daemon-revive child calls this with force=True.
+    if _daemon_snapshot_sandboxed():
+        return "noop-sandbox"
     # Cheapest gates first -- all pure/stat, no subprocess.
     if _is_foreign_runtime() or detect_runtime() != "claude":
         return "noop-foreign"
@@ -27951,6 +28086,8 @@ def _daemon_midsession_pulse():
     installer. Returns a short status string. Never raises, never blocks.
     """
     try:
+        if _daemon_snapshot_sandboxed():
+            return "noop-sandbox"
         # SAFETY gates run EVERY turn, BEFORE the probe throttle: a
         # disabled/uninstalled/thrashing daemon must NEVER be revived, not even on
         # the 59/60 throttled turns. All are cheap (a stat + a small config read +
@@ -28193,11 +28330,13 @@ def _daemon_resurrection_blocked():
     the user turned off. One helper, checked by every path that could
     (re)start a daemon, so no future call site can bypass a gate by accident.
 
-    Returns the blocking reason (``"tombstoned"`` | ``"disabled"`` |
-    ``"install-failed"``) or None when the action may proceed. The tombstone
+    Returns the blocking reason (``"sandbox"`` | ``"tombstoned"`` |
+    ``"disabled"`` | ``"install-failed"``) or None when the action may proceed. The tombstone
     stat fails open (matching ``_daemon_install_failed_marker_present``: an
     unreadable state dir is not evidence of intent). Never raises.
     """
+    if _daemon_snapshot_sandboxed():
+        return "sandbox"
     try:
         if os.path.exists(str(DAEMON_THRASH_BREADCRUMB)):
             return "tombstoned"
@@ -28497,6 +28636,8 @@ def _restart_dashboard_daemon(system):
     would SIGTERM session A's freshly-bound correct daemon, causing a restart
     flap. Checking the served version first makes the whole restart idempotent.
     """
+    if _daemon_snapshot_sandboxed():
+        return "noop-sandbox"
     try:
         # Already current (a sibling session fixed it)? Do not reap/restart.
         if _daemon_served_version() == TOKEN_OPTIMIZER_VERSION:
@@ -33073,6 +33214,19 @@ def _mark_ran_this_session(tag, session_id):
         pass
 
 
+def _safe_event(event):
+    """The hookEventName to stamp on an envelope: the firing event verbatim,
+    falling back to SessionStart only when it is missing or not a string.
+
+    Every emitter path (single-object passthrough, multi-object merge,
+    _emit_additional_context) MUST agree here. An earlier inline copy forced
+    SessionStart for any non-SessionStart event, so a UserPromptSubmit envelope
+    was stamped SessionStart and Claude Code discarded the whole hook result.
+    Keeping one helper stops that divergence from recurring per-path.
+    """
+    return event if (isinstance(event, str) and event) else "SessionStart"
+
+
 def _emit_additional_context(text, event="SessionStart"):
     """Emit hook stdout as the documented ``additionalContext`` JSON envelope.
 
@@ -33111,7 +33265,7 @@ def _emit_additional_context(text, event="SessionStart"):
     print(json.dumps({
         "continue": True,
         "hookSpecificOutput": {
-            "hookEventName": event,
+            "hookEventName": _safe_event(event),
             "additionalContext": text,
         },
     }))
@@ -33168,8 +33322,7 @@ def _sanitize_hook_output_payload(obj, event):
                     out[key] = value
     hso = obj.get("hookSpecificOutput")
     if isinstance(hso, dict):
-        safe_event = "SessionStart" if event != "SessionStart" else event
-        clean = {"hookEventName": safe_event}
+        clean = {"hookEventName": _safe_event(event)}
         ctx = hso.get("additionalContext")
         if isinstance(ctx, str) and ctx.strip():
             clean["additionalContext"] = ctx
@@ -33257,7 +33410,7 @@ def _collapse_hook_stdout(text, event="SessionStart"):
         payload["systemMessage"] = "\n\n".join(system_messages)
     if contexts:
         payload["hookSpecificOutput"] = {
-            "hookEventName": event,
+            "hookEventName": _safe_event(event),
             "additionalContext": "\n\n".join(contexts),
         }
     if not payload:
@@ -39732,6 +39885,9 @@ def runway_snapshot(days=30, now=None):
         meter_available = bool(meters.get("available"))
         meter_stale = bool(meters.get("stale")) or not meter_available
 
+        weekly_full = _weekly_full_savings(
+            resets_at=meters.get("seven_day_resets_at"), now=now)
+
         # --- context lever: measured, never estimated ---
         consumed = saved = 0
         spent_basis = None
@@ -39753,19 +39909,21 @@ def runway_snapshot(days=30, now=None):
                 conn.close()
         except Exception:
             return None
-        if consumed <= 0:
+        if consumed <= 0 and not weekly_full:
             return None
-        context_mult = (consumed + saved) / consumed
+        context_mult = (consumed + saved) / consumed if consumed > 0 else 1.0
 
         # --- routing lever: this user's own shift, priced by input rates ---
         routing_mult = _input_rate_mix_ratio(days=days)
         if routing_mult is None or routing_mult <= 0:
-            return None
+            if not weekly_full:
+                return None
+            routing_mult = 1.0
 
         mult = context_mult * routing_mult
         # Below ~1.02 there is no story worth telling and rounding noise would
         # dominate; say nothing rather than dress up a rounding artefact.
-        if mult < 1.02:
+        if mult < 1.02 and not weekly_full:
             return None
 
         # --- USD-per-window: API-credit OVERAGE over each window's OWN real span ---
@@ -39843,7 +40001,7 @@ def runway_snapshot(days=30, now=None):
                     # -- real, magnitude-metered (v5.13.1) savings that were simply
                     # unlabelled. Window-scoped already (days/since passed above).
                     _rl = wm.get("resume_lean_estimated") or {}
-                    _vs = wm.get("verbosity_steer_estimated") or {}
+                    _vs = wm.get("verbosity_steer") or wm.get("verbosity_steer_estimated") or {}
                     est_add = float(_rl.get("cost_saved_usd", 0.0) or 0.0) \
                         + float(_vs.get("cost_saved_usd", 0.0) or 0.0)
                 except Exception:
@@ -39853,16 +40011,16 @@ def runway_snapshot(days=30, now=None):
                     try:
                         end_utc = datetime.now(timezone.utc).replace(tzinfo=None)
                         if since_iso:
-                            start_utc = datetime.fromisoformat(since_iso)
-                            if start_utc.tzinfo is not None:
-                                start_utc = start_utc.astimezone(timezone.utc).replace(tzinfo=None)
+                            start_utc = _counted_event_utc(since_iso)
                         else:
                             start_utc = end_utc - timedelta(days=wdays)
                         counted = _counted_window_summary(conn, start_utc, end_utc)
                     finally:
                         conn.close()
                     if counted.get("available"):
-                        ctx = float(counted.get("total_usd", 0.0) or 0.0)
+                        # Keep setup, output, unmatched events and other logged
+                        # savings. Their initial removals are already in merged_ctx.
+                        ctx = merged_ctx + float(counted.get("reread_usd", 0.0) or 0.0)
                         counted_window = True
                 except Exception:
                     # Older databases without counted_reread retain the legacy
@@ -39875,6 +40033,9 @@ def runway_snapshot(days=30, now=None):
                 # trigger is counterfactual even though the magnitude is metered.
                 ctx += est_add
                 est_added = est_add > 0.0
+                if wdays == 7 and weekly_full:
+                    ctx, rt = weekly_full["saved_usd"], 0.0
+                    est_added = True
                 _overage_cache[cache_key] = (ctx, rt, repriced, counted_window, est_added)
             ctx, rt, repriced, counted_window, est_added = _overage_cache[cache_key]
             total = ctx + rt
@@ -39932,6 +40093,7 @@ def runway_snapshot(days=30, now=None):
                 "would_be_capped": head_cf <= 0.5,
                 "saved_usd": window_saved_usd,
                 "saved_usd_tier": window_usd_tier,
+                "full_value": weekly_full if key == "seven_day" else None,
             })
         # REGRESSION FIX (the "Your plan goes further" card vanished after a quiet
         # week): the per-window guard above drops the 5h window once the meter is
@@ -40004,7 +40166,9 @@ def runway_snapshot(days=30, now=None):
             "saved_usd_context": round(saved_context_usd, 2),
             "saved_usd_routing": round(saved_routing_usd, 2),
             "saved_usd_tier": saved_usd_tier,
+            "weekly_full_value": weekly_full,
             "window_savings_basis": (
+                "full workload, exact subscription week" if weekly_full else
                 "counted transcript window" if _wk_counted else "flat savings ledger fallback"),
             # period_days scopes the throughput MULTIPLIERS (context/routing), not
             # the per-window dollars: each window now prices overage over its OWN
@@ -40023,13 +40187,17 @@ def runway_snapshot(days=30, now=None):
             # longer repeats it. Keep the phrases "metered savings ledger" and "not
             # derived from the throughput multipliers" -- guarded by
             # test_proxy_disclosure_mentions_ledger_reuse.
-            "proxy": ("Your window usage is measured; the “without” "
+            "proxy": ("Weekly dollars use the Savings tab's full workload estimate for activity "
+                      "since the subscription reset, at constant prices. Measured and estimated "
+                      "effects overlap, so they are counted once. This is accrued API-equivalent "
+                      "value, not a forecast or an overage bill. The headline percentage covers "
+                      "30 days; window comparisons are estimates." if weekly_full else ("Your window usage is measured; the “without” "
                       "comparison and routing dollars are estimated (the provider "
                       "does not publish how it weights models inside a window, so "
                       "public input-rate ratios stand in). Per-window dollars reuse "
                       "the metered savings ledger (context tokens never sent, priced "
                       "at input rates, plus a routing estimate) and are not derived "
-                      "from the throughput multipliers."),
+                      "from the throughput multipliers.")),
         }
     except Exception:
         return None
@@ -42474,6 +42642,10 @@ def _price_parent_window(conn, where, params, tier):
         "FROM session_log WHERE input_tokens IS NOT NULL "
         "AND COALESCE(is_sidechain, 0) = 0 " + where, params
     ).fetchall()
+    return _price_parent_rows(rows, tier)
+
+
+def _price_parent_rows(rows, tier):
     if not rows:
         return None
     default_model = _default_model_for_runtime()
@@ -42512,7 +42684,34 @@ def _price_parent_window(conn, where, params, tier):
             "flat_usd": flat_usd, "api_calls": api_calls, "messages": messages}
 
 
-def _session_weight_pool_savings(cutoff, days=30, tier=None):
+def _stable_workload_anchor(before, month):
+    """Keep the existing workload comparison stable during session refreshes."""
+    path = SNAPSHOT_DIR / "workload_anchor.json"
+    try:
+        if path.exists():
+            frozen = json.loads(path.read_text(encoding="utf-8"))
+            metrics = frozen.get("metrics") if isinstance(frozen, dict) else None
+            if (isinstance(metrics, dict) and frozen.get("month") == month
+                    and frozen.get("rates") == _WEIGHT_POOL_FLAT_RATES
+                    and all(isinstance(metrics.get(k), (int, float))
+                            and math.isfinite(metrics[k]) and metrics[k] >= 0
+                            for k in ("sessions", "usd", "tokens", "flat_usd", "api_calls", "messages"))
+                    and metrics["sessions"] >= _SESSION_WEIGHT_MIN_ANCHOR_SESSIONS
+                    and metrics["api_calls"] > 0 and metrics["flat_usd"] > 0):
+                return metrics
+            # Backfill/rebuild can change the earliest covered month. Re-anchor
+            # from the same shared population instead of permanently hiding it.
+        if (before and before["sessions"] >= _SESSION_WEIGHT_MIN_ANCHOR_SESSIONS
+                and before["api_calls"] > 0 and before["flat_usd"] > 0):
+            _write_baseline_state(path, {"month": month, "metrics": before,
+                                        "rates": _WEIGHT_POOL_FLAT_RATES,
+                                        "captured_at": datetime.now().isoformat()})
+        return before
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _session_weight_pool_savings(cutoff, days=30, tier=None, activity_window=None):
     """THE volume lever: cost per UNIT OF WORK, over the whole parent population.
 
     The frozen-anchor pool holds session volume constant across both arms by
@@ -42578,7 +42777,10 @@ def _session_weight_pool_savings(cutoff, days=30, tier=None):
                 return None
             before = _price_parent_window(
                 conn, "AND date LIKE ?", (anchor_month + "%",), tier)
-            now = _price_parent_window(conn, "AND date >= ?", (cutoff,), tier)
+            before = _stable_workload_anchor(before, anchor_month)
+            now = (_price_parent_activity_window(conn, *activity_window, tier)
+                   if activity_window else
+                   _price_parent_window(conn, "AND date >= ?", (cutoff,), tier))
         finally:
             conn.close()
         if not before or not now:
@@ -42681,6 +42883,115 @@ def _session_weight_pool_savings(cutoff, days=30, tier=None):
             "capacity_assumption": capacity_note,
         }
     except (sqlite3.Error, OSError, ValueError, TypeError, ZeroDivisionError):
+        return None
+
+
+def _price_parent_activity_window(conn, start, end, tier):
+    """Use real in-window activity with the standard parent/child pricing rules.
+
+    Reading transcripts here also keeps a weekly report correct while bounded
+    background collection catches up. Missing files produce an unavailable
+    estimate instead of silently treating missing work as zero cost.
+    """
+    paths = conn.execute(
+        "SELECT jsonl_path, date FROM session_log WHERE input_tokens IS NOT NULL "
+        "AND COALESCE(is_sidechain,0)=0").fetchall()
+    # Include new sessions before bounded collection reaches them.
+    known = {str(name) for name, _ in paths}
+    for path, mtime, _ in _find_all_jsonl_files(8):
+        if str(path) not in known:
+            paths.append((str(path), datetime.fromtimestamp(mtime).date().isoformat()))
+            known.add(str(path))
+    rows = []
+    for name, recorded_date in paths:
+        path = Path(name)
+        if not path.exists():
+            if str(recorded_date) < start.date().isoformat():
+                continue
+            return None
+        children = _find_subagent_jsonl_files(path)
+        if max(p.stat().st_mtime for p in [path, *children]) < start.timestamp():
+            continue
+        parsed = _parse_session_jsonl(path, window_start=start, window_end=end)
+        if parsed and parsed.get("is_sidechain"):
+            continue
+        if not parsed:
+            parsed = {"total_input_tokens": 0, "total_output_tokens": 0,
+                      "total_cache_create_1h": 0, "total_cache_create_5m": 0,
+                      "cache_hit_rate": 0, "model_usage": {}, "api_calls": 0,
+                      "message_count": 0}
+        inp, out = parsed["total_input_tokens"], parsed["total_output_tokens"]
+        cw1, cw5 = parsed["total_cache_create_1h"], parsed["total_cache_create_5m"]
+        child_cache_read = 0
+        for child in children:
+            cp = _parse_session_jsonl(child, window_start=start, window_end=end)
+            if cp:
+                inp += cp["total_input_tokens"]
+                out += cp["total_output_tokens"]
+                cw1 += cp["total_cache_create_1h"]
+                cw5 += cp["total_cache_create_5m"]
+                child_cache_read += cp["total_cache_read"]
+        if not parsed["api_calls"] and inp + out == 0:
+            continue
+        usage = json.dumps(parsed["model_usage"])
+        hit = (parsed["cache_hit_rate"] if parsed["api_calls"] else
+               child_cache_read / inp if inp else 0)
+        rows.append((inp, out, cw5, cw1, hit, usage, usage,
+                     parsed["api_calls"], parsed["message_count"]))
+    return _price_parent_rows(rows, tier)
+
+
+def _weekly_full_savings(resets_at=None, now=None):
+    """The Savings tab's full estimate, accrued inside this subscription week.
+
+    Its before/after difference already includes overlapping measured and
+    estimated mechanisms. Never add their individual estimates on top.
+    """
+    if detect_runtime() != "claude":
+        return None
+    try:
+        end = datetime.fromtimestamp(now if now is not None else time.time(), timezone.utc)
+        start = (datetime.fromtimestamp(float(resets_at), timezone.utc) - timedelta(days=7)
+                 if resets_at is not None else end - timedelta(days=7))
+        if resets_at is None or start >= end or end.timestamp() >= float(resets_at):
+            return None
+        # Dashboard refreshes may run several times per minute in separate
+        # processes. Keep an explicitly dated result for at most 60 seconds.
+        cache_path = SNAPSHOT_DIR / "weekly_full_value.json"
+        anchor_path = SNAPSHOT_DIR / "workload_anchor.json"
+        anchor_stamp = anchor_path.stat().st_mtime_ns if anchor_path.exists() else None
+        if now is None and cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                age = end.timestamp() - float(cached["computed_at"])
+                if (0 <= age < 60 and cached["start"] == start.isoformat()
+                        and cached["anchor_stamp"] == anchor_stamp
+                        and cached["version"] == TOKEN_OPTIMIZER_VERSION):
+                    return cached["value"]
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+        pool = _session_weight_pool_savings(
+            start.isoformat(), days=7, activity_window=(start, end))
+        if not pool:
+            return None
+        # Same conservative display cap as the Savings tab.
+        saving = max(0.0, min(pool["transformation_usd"], pool["actual_usd"]))
+        value = {"saved_usd": round(saving, 2), "start": start.isoformat(),
+                "end": end.isoformat(), "method": "full workload",
+                "uncapped_usd": round(pool["transformation_usd"], 2),
+                "actual_usd": round(pool["actual_usd"], 2),
+                "counterfactual_usd": round(pool["counterfactual_usd"], 2),
+                "api_calls": pool["now_units"], "anchor_month": pool["anchor_month"]}
+        if now is None:
+            try:
+                _write_baseline_state(cache_path, {
+                    "computed_at": end.timestamp(), "start": start.isoformat(),
+                    "anchor_stamp": anchor_path.stat().st_mtime_ns if anchor_path.exists() else None,
+                    "version": TOKEN_OPTIMIZER_VERSION, "value": value})
+            except OSError:
+                pass
+        return value
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
         return None
 
 
@@ -43850,7 +44161,7 @@ def _savings_since_install():
             float((full.get(k) or {}).get("cost_saved_usd", 0) or 0)
             for k in (
                 "behavioral_estimate", "uncaptured_runtime", "mcp_cap_estimated",
-                "contamination_exit", "handover_rerun", "resume_lean_estimated",
+                "contamination_exit", "handover_rerun", "resume_lean_estimated", "verbosity_steer",
             )
         )
         # Avoided-search: prefer the deterministic observed hint->read measure
@@ -45301,8 +45612,8 @@ def run_ensure_health():
     try:
         current_marker = f'TOKEN_OPTIMIZER_DAEMON_VERSION = "{TOKEN_OPTIMIZER_VERSION}"'
         legacy_dir = RUNTIME_DIR / "_backups" / "token-optimizer"
-        candidate_paths = {SNAPSHOT_DIR / "dashboard-server.py",
-                           legacy_dir / "dashboard-server.py"}
+        candidate_paths = set() if _daemon_snapshot_sandboxed() else {
+            SNAPSHOT_DIR / "dashboard-server.py", legacy_dir / "dashboard-server.py"}
         # The auto-update refresh writes dashboard-server.py (not the LaunchAgent
         # plist) and reloads via `launchctl kickstart`, which restarts the process
         # without re-registering the background item -- so it does NOT fire the
@@ -45879,6 +46190,8 @@ def _ensure_health_daemon_revive_first():
     pulse provides a second, session-independent recovery path. Idempotent +
     fail-open: a spawn failure is swallowed, never raised into the hook.
     """
+    if _daemon_snapshot_sandboxed():
+        return "noop-sandbox"
     try:
         _proc = spawn_detached(
             [_detached_python_exe(), str(MEASURE_PY_PATH), "daemon-revive"],

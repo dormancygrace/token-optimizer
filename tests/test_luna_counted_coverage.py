@@ -155,7 +155,7 @@ def test_window_dollars_use_counted_compounding_not_flat_ledger(measure, tmp_pat
     assert "deduped turns" in result["method"]
 
 
-def test_runway_window_spine_uses_counted_window_total(measure, tmp_path, monkeypatch):
+def test_runway_window_keeps_disjoint_logged_savings(measure, tmp_path, monkeypatch):
     """The rendered weekly dollar must use the counted window result."""
     db = tmp_path / "trends.db"
     conn = _schema_db(measure, db)
@@ -189,12 +189,12 @@ def test_runway_window_spine_uses_counted_window_total(measure, tmp_path, monkey
         "age_s": 1.0, "ts": time.time() - 1,
     })
     monkeypatch.setattr(measure, "_get_merged_savings", lambda **_: {
-        "total_cost_usd": 30.0,
+        "total_cost_usd": 40.0,  # $30 removal + $10 setup/output or unmatched events
         "model_routing": {"realized_cost_usd": 0.0},
     })
 
     result = measure.runway_snapshot(days=30)
     weekly = next(window for window in result["windows"] if window["key"] == "seven_day")
-    assert weekly["saved_usd"] == pytest.approx(36.0, abs=1e-6)
+    assert weekly["saved_usd"] == pytest.approx(46.0, abs=1e-6)
     assert weekly["saved_usd"] > 30.0
     assert result["window_savings_basis"] == "counted transcript window"

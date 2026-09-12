@@ -5,6 +5,16 @@ import { TrendsStore } from "../storage/trends.js";
 import { scoreToGrade, scoreToBand } from "../util/grade.js";
 import { computeRealizedSavings } from "../savings.js";
 
+// Version labels — persistent across all dashboard views (parity with the
+// canonical Python dashboard's brand-meta nav label). The CORE version tracks
+// the canonical Token Optimizer dashboard (source of truth: .claude-plugin/
+// plugin.json `version`). The ADAPTER version is this OpenCode package's own
+// release (source of truth: opencode/package.json `version`). They are
+// intentionally independent: the adapter ships at its own cadence and is NOT
+// required to match the core number.
+const CORE_VERSION = "5.13.10";
+const ADAPTER_VERSION = "1.1.7";
+
 export interface DashboardOptions {
   dataDir: string;
   outputPath?: string;
@@ -313,9 +323,9 @@ tr:hover td { background: var(--bg-hover); }
   <div class="header">
     <div>
       <h1>Token Optimizer</h1>
-      <div class="sub">OpenCode Dashboard &middot; Last ${days} days &middot; ${totalSessions} sessions</div>
+      <div class="sub">OpenCode Dashboard &middot; Core v${CORE_VERSION} &middot; Adapter v${ADAPTER_VERSION} &middot; Last ${days} days &middot; ${totalSessions} sessions</div>
     </div>
-    <div class="sub">Generated ${esc(new Date().toISOString().slice(0, 16).replace("T", " "))}</div>
+    <div class="sub">Generated ${esc(new Date().toISOString().slice(0, 16).replace("T", " "))} &middot; Run <code style="font-family:monospace;background:var(--bg-hover);padding:1px 5px;border-radius:3px">token_dashboard</code> to refresh</div>
   </div>
 
   <div class="nav">
@@ -511,6 +521,37 @@ tr:hover td { background: var(--bg-hover); }
     </div>
     `}
 
+    <!-- Selected-period savings_events: raw window sums, measured + estimated. -->
+    ${(() => {
+      const measuredWindow = Math.max(0, savings.compressionMeasuredWindowUsd);
+      const estimatedWindow = Math.max(0, savings.verbosityMeasuredWindowUsd);
+      const actionTotal = measuredWindow + estimatedWindow;
+      // Fail-open: render only when there is a real period total. A $0 card
+      // when no savings_events exist reads as "TO saved you nothing", which
+      // is misleading on a mature install with zero compression events.
+      if (actionTotal < 0.005) return "";
+      const periodLabel = runRate ? `last ${days} days` : `${trackedDays} day${trackedDays === 1 ? "" : "s"} tracked`;
+      return `
+    <div data-card="action-savings" style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:var(--s-4);margin-bottom:var(--s-4);">
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim);margin-bottom:var(--s-2);">Action savings &middot; ${periodLabel}</div>
+      <div style="display:flex;align-items:baseline;gap:var(--s-2);flex-wrap:wrap;margin-bottom:var(--s-3);">
+        <span style="font-family:monospace;font-size:32px;font-weight:700;color:var(--success)">${fmtCost(actionTotal)}</span>
+        <span style="font-size:14px;color:var(--text-dim);font-family:monospace;">logged + estimated</span>
+      </div>
+      <div style="display:flex;gap:var(--s-6);flex-wrap:wrap;font-size:13px;color:var(--text-dim);margin-bottom:var(--s-3);">
+        <span>Logged actions <strong style="color:var(--text)">${fmtCost(measuredWindow)}</strong></span>
+        <span>Repeat reads avoided <strong style="color:var(--text-dim)">unavailable</strong></span>
+        <span>Other estimates <strong style="color:var(--text)">~${fmtCost(estimatedWindow)}</strong></span>
+      </div>
+      <div style="font-size:12px;color:var(--text-dim);line-height:1.6;">
+        Context removals logged during this period (tool archives, delta reads, structure maps), counted once at removal time.
+        Repeat-read coverage is unavailable on OpenCode; logged actions are still included.
+        ${estimatedWindow > 0 ? "Other estimates are lean-output nudges (trigger observed, magnitude estimated)." : ""}
+      </div>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:var(--s-2);">${BILLING_CAPTION}</div>
+    </div>`;
+    })()}
+
     <!-- TOKENS SAVED card (relocated from the Overview view): the 2nd card in
          the Savings view, right after the transformation hero above and before
          the measured-floor card below. Card content unchanged; only its
@@ -639,6 +680,7 @@ tr:hover td { background: var(--bg-hover); }
 
   <footer class="oc-footer">
     <span class="byline">Built by <a href="https://linkedin.com/in/alexgreensh" target="_blank" rel="noopener">Alex Greenshpun</a></span>
+    <span class="byline" style="opacity:0.7">Core v${CORE_VERSION} &middot; Adapter v${ADAPTER_VERSION}</span>
     <a class="gh-star" href="https://github.com/alexgreensh/token-optimizer" target="_blank" rel="noopener" title="Star Token Optimizer on GitHub">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2.5l2.9 6.06 6.6.59-5 4.38 1.5 6.47L12 16.98 5.99 20.5l1.5-6.47-5-4.38 6.6-.59L12 2.5z"/></svg>
       <span>Star on GitHub</span>

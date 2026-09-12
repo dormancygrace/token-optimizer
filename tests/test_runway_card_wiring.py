@@ -97,11 +97,8 @@ def test_runway_card_validates_numbers_before_rendering():
         assert raw not in body, f"raw interpolation of {raw!r} bypasses validation"
 
 
-def test_runway_usd_label_is_honest_overage():
-    """The per-window USD label must frame the dollar as the API-credit OVERAGE the
-    same work would have cost WITHOUT Token Optimizer, over the window's own real
-    span -- NOT a pro-rata slice of a longer ledger, and NOT 'freed within this
-    window' (which would overclaim window-realized savings)."""
+def test_runway_usd_label_is_api_value_for_the_actual_window():
+    """API-price savings belong to the actual window, without claiming a bill."""
     html = (ASSETS / "dashboard.html").read_text(encoding="utf-8")
     start = html.index("function runwayCardHtml(")
     body = html[start:start + 12000]
@@ -114,10 +111,9 @@ def test_runway_usd_label_is_honest_overage():
     # The dishonest time-slice framing is gone.
     assert "pro-rata" not in body, (
         "runway card still labels the per-window USD as a pro-rata slice -- the "
-        "time-slice proration was replaced by a real-span overage figure"
+        "time-slice proration was replaced by a real-span estimate"
     )
-    # The honest overage framing is present.
-    assert "in API credits" in body and "without Token Optimizer" in body, (
-        "runway card must frame the per-window USD as API-credit overage to do the "
-        "same work without Token Optimizer"
+    assert "in API-equivalent savings this week" in body and "without Token Optimizer" in body, (
+        "runway card must label the API-price estimate for the same work"
     )
+    assert "Your plan may cover some or all of that usage" in body

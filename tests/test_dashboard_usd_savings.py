@@ -311,11 +311,11 @@ def test_dashboard_per_window_card_shows_usd():
     end = html.index("}).join('');", start)
     body = html[start:end]
     assert "w.saved_usd" in body
-    # The per-window USD is framed as API-credit overage over the window's real
-    # span, NOT "freed this window" and NOT a pro-rata slice of a longer ledger.
-    assert "in API credits" in body and "without Token Optimizer" in body, (
-        "per-window card does not render the honest overage USD line"
+    # API-price savings can remain inside the subscription allowance.
+    assert "in API-equivalent savings this week" in body and "at API prices" in body, (
+        "per-window card does not distinguish API value from a bill"
     )
+    assert "Your plan may cover some or all of that usage" in body
     assert "pro-rata" not in body, "per-window card still uses the old time-slice label"
     # Graceful: when saved_usd is absent/None, no line is rendered (no $-0/NaN).
     assert "hasUsd" in body, "per-window card does not gate the USD line on presence"

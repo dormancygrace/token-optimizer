@@ -34,6 +34,7 @@ def m(monkeypatch, tmp_path):
     mod = importlib.import_module("measure")
     importlib.reload(mod)
     mod._apply_sonnet_intro_pricing()
+    monkeypatch.setattr(mod, "detect_runtime", lambda: "claude")
     yield mod
     if "measure" in sys.modules:
         del sys.modules["measure"]
@@ -320,3 +321,99 @@ def test_uuidless_compression_row_stays_out_without_a_transcript(m, tmp_path, mo
     row = conn.execute("SELECT COUNT(*) FROM counted_reread").fetchone()
     conn.close()
     assert row[0] == 0
+
+
+def test_period_rollup_reconciles_to_lifetime_without_rewalking(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    with sqlite3.connect(str(dbp)) as conn:
+        for key, age, one, rereads in [('old', 40, 2, 20), ('new', 2, 3, 30), ('debit', 1, -1, -10)]:
+            ts = (now - timedelta(days=age)).isoformat()
+            conn.execute('INSERT INTO counted_reread(event_key,event_ts,event_month,tokens,oneshot_usd,reread_usd) VALUES(?,?,?,?,?,?)',
+                         (key, ts, ts[:7], 100, one, rereads))
+    monkeypatch.setattr(m, '_counted_walk_transcript', lambda *a, **k: pytest.fail('rollup must not parse transcripts'))
+    recent = m._counted_cumulative_summary(days=30, now=now)
+    lifetime = m._counted_cumulative_summary()
+    assert recent['available'] is True
+    assert recent['oneshot_usd'] == 2
+    assert recent['reread_usd'] == 20
+    assert recent['total_usd'] == 22
+    assert lifetime['total_usd'] == 44
+    assert recent['attribution'] == 'removal_time'
+
+
+def test_period_boundaries_offsets_and_future_events(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    now = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+    start = now - timedelta(days=30)
+    times = [start.isoformat(), (start - timedelta(seconds=1)).isoformat(),
+             now.isoformat(), (now + timedelta(seconds=1)).isoformat(),
+             start.astimezone(timezone(timedelta(hours=3))).isoformat(), 'invalid']
+    with sqlite3.connect(str(dbp)) as conn:
+        for i, ts in enumerate(times):
+            conn.execute('INSERT INTO counted_reread(event_key,event_ts,event_month,oneshot_usd,reread_usd) VALUES(?,?,?,?,?)',
+                         (str(i), ts, ts[:7], 1, 10))
+    recent = m._counted_cumulative_summary(days=30, now=now)
+    assert recent['events'] == 3
+    assert recent['total_usd'] == 33
+
+
+def test_empty_period_is_zero_not_lifetime_fallback(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    old = (datetime.now(timezone.utc) - timedelta(days=50)).isoformat()
+    with sqlite3.connect(str(dbp)) as conn:
+        conn.execute('INSERT INTO counted_reread(event_key,event_ts,event_month,oneshot_usd,reread_usd) VALUES(?,?,?,?,?)',
+                     ('old', old, old[:7], 5, 50))
+    recent = m._counted_cumulative_summary(days=30)
+    assert recent['available'] is True
+    assert recent['total_usd'] == 0
+    assert recent['events'] == 0
+
+
+@pytest.mark.parametrize('runtime', ['codex', 'hermes', 'copilot', 'cursor', 'antigravity', 'grok', 'opencode', 'openclaw'])
+def test_period_has_no_invented_foreign_rereads(m, monkeypatch, runtime):
+    monkeypatch.setattr(m, 'detect_runtime', lambda: runtime)
+    assert m._counted_cumulative_summary(days=30) == {'available': False}
+
+
+def test_delta_mirror_is_removed_without_deleting_source_telemetry(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    _, start = _transcript(m, tmp_path, monkeypatch, n_turns=5)
+    ts = _local_iso(start + timedelta(seconds=30))
+    _add_event(dbp, 'delta_read', 1000, ts)
+    _add_event(dbp, 'delta_read', 1000, ts, table='compression_events')
+    with sqlite3.connect(str(dbp)) as conn:
+        conn.execute("INSERT INTO counted_reread(event_key, source, session_uuid, oneshot_usd, reread_usd) VALUES('ce:1','ce',?,99,999)", (SID,))
+        conn.commit()
+        result = m._update_counted_cumulative(conn)
+        assert result['duplicate_rows_removed'] == 1
+        assert conn.execute('SELECT event_key FROM counted_reread').fetchall() == [('se:1',)]
+        assert conn.execute('SELECT COUNT(*) FROM compression_events').fetchone()[0] == 1
+        assert conn.execute('SELECT COUNT(*) FROM savings_events').fetchone()[0] == 1
+
+
+def test_transcript_rotation_preserves_previously_verified_history(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    monkeypatch.setattr(m, '_counted_session_path', lambda *a: None)
+    with sqlite3.connect(str(dbp)) as conn:
+        conn.executemany('INSERT INTO counted_reread(event_key,session_uuid,oneshot_usd,reread_usd,transcript_mtime) VALUES(?,?,?,?,?)',
+                         [('verified', SID, 5, 50, 1234.0), ('never_verified', SID, 9, 90, None)])
+        conn.commit()
+        assert m._purge_counted_without_transcripts(conn) == 1
+        assert conn.execute('SELECT event_key,oneshot_usd,reread_usd FROM counted_reread').fetchall() == [('verified', 5, 50)]
+
+
+def test_transcript_rotation_preserves_marker_backfill_history(m, tmp_path, monkeypatch):
+    dbp = _db(m, tmp_path, monkeypatch)
+    monkeypatch.setattr(m, '_counted_session_path', lambda *a: None)
+    with sqlite3.connect(str(dbp)) as conn:
+        conn.execute(
+            "INSERT INTO counted_reread(event_key,source,session_uuid,oneshot_usd,"
+            "reread_usd,transcript_mtime) VALUES('mk:old:0','mk',?,?,?,NULL)",
+            (SID, 5, 50),
+        )
+        conn.commit()
+        assert m._purge_counted_without_transcripts(conn) == 0
+        assert conn.execute(
+            'SELECT event_key,oneshot_usd,reread_usd FROM counted_reread'
+        ).fetchall() == [('mk:old:0', 5, 50)]

@@ -32,6 +32,8 @@ def m(monkeypatch):
         del sys.modules["measure"]
     mod = importlib.import_module("measure")
     importlib.reload(mod)
+    # Revive subprocesses are replaced by counters in every active path here.
+    monkeypatch.setattr(mod, "_daemon_snapshot_sandboxed", lambda: False)
     # Present as a Claude runtime on a supported platform by default.
     monkeypatch.setattr(mod, "_is_foreign_runtime", lambda: False)
     monkeypatch.setattr(mod, "detect_runtime", lambda: "claude")

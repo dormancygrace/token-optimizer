@@ -107,8 +107,6 @@ export const DEFAULT_PRICING: Record<string, ModelPricing> = {
 // the wall clock; TOKEN_OPTIMIZER_PRICING_AS_OF (YYYY-MM-DD) pins it for deterministic tests.
 // The single "sonnet" bucket cannot isolate Sonnet 5, so Sonnet 4.6 is repriced too (accepted
 // 2026-07-10). Mirrors measure.py `_apply_sonnet_intro_pricing`.
-const SONNET_INTRO_UNTIL = Date.parse("2026-09-01T00:00:00Z");
-const SONNET_STANDARD: ModelPricing = { input: 3.0 / 1e6, output: 15.0 / 1e6, cacheRead: 0.3 / 1e6, cacheWrite: 3.75 / 1e6, cacheWrite1h: 6.0 / 1e6 };
 const SONNET_INTRO: ModelPricing = { input: 2.0 / 1e6, output: 10.0 / 1e6, cacheRead: 0.2 / 1e6, cacheWrite: 2.5 / 1e6, cacheWrite1h: 4.0 / 1e6 };
 
 /** Swap the sonnet card to the introductory rate while it is in effect (idempotent). Returns

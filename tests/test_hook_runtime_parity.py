@@ -483,6 +483,7 @@ def test_windows_simulation_uses_portable_config_and_tripwire_leases(
     monkeypatch.setattr(measure, "SNAPSHOT_DIR", tmp_path / "snapshots")
     monkeypatch.setattr(measure, "_CODEX_CONFIG_LOCK_PATH", tmp_path / ".codex-config.lock")
     monkeypatch.setattr(measure, "CLAUDE_DIR", tmp_path / "claude")
+    monkeypatch.setattr(measure, "SETTINGS_PATH", tmp_path / "claude" / "settings.json")
     monkeypatch.setattr(measure, "_SETTINGS_LOCK_PATH", tmp_path / ".settings.lock")
 
     try:

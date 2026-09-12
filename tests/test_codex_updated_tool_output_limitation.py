@@ -29,9 +29,24 @@ import tempfile
 import uuid
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "skills" / "token-optimizer" / "scripts"
 BASH_COMPRESS_HOOK = SCRIPTS / "bash_compress_hook.py"
+
+
+@pytest.fixture()
+def isolated_thrash_modules():
+    """Restore import-time path globals after the thrash integration test."""
+    names = ("plugin_env", "session_store", "delta_diff", "thrash_guard")
+    saved = {name: sys.modules.get(name) for name in names}
+    yield
+    for name, module in saved.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
 
 
 def test_codex_install_passes_no_updated_tool_output_env():
@@ -174,7 +189,7 @@ def test_codex_nudge_reaches_model_via_additional_context():
     )
 
 
-def test_codex_runtime_still_records_thrash_guard(monkeypatch):
+def test_codex_runtime_still_records_thrash_guard(monkeypatch, isolated_thrash_modules):
     """With TOKEN_OPTIMIZER_NO_UPDATED_TOOL_OUTPUT=1, thrash_guard must
     still record the Bash run. The flag only suppresses emission, not
     recording."""
@@ -206,7 +221,7 @@ def test_codex_runtime_still_records_thrash_guard(monkeypatch):
 
     monkeypatch.setenv("TOKEN_OPTIMIZER_SNAPSHOT_DIR", tmp)
     sys.path.insert(0, str(SCRIPTS))
-    for m in ("session_store", "delta_diff", "thrash_guard"):
+    for m in ("plugin_env", "session_store", "delta_diff", "thrash_guard"):
         sys.modules.pop(m, None)
     from session_store import SessionStore
     from delta_diff import content_hash

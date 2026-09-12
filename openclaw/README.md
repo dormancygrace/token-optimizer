@@ -1,6 +1,6 @@
 # Token Optimizer for OpenClaw
 
-Version: `2.4.13`
+Version: `2.4.21`
 
 **Your AI is getting dumber and you can't see it.**
 
@@ -12,23 +12,33 @@ Native TypeScript plugin for OpenClaw agent systems. Zero Python dependency. Wor
 
 ## Install
 
-```sh
-# From GitHub (recommended)
-openclaw plugins install github:alexgreensh/token-optimizer
-
-# From ClawHub
-openclaw plugins install token-optimizer
-```
-
-Or from source:
+From source (the supported path):
 
 ```sh
 git clone https://github.com/alexgreensh/token-optimizer
-cd token-optimizer/openclaw && npm install && npm run build
+cd token-optimizer/openclaw
+npm install
+npm run build
+```
+
+This plugin's `package.json` lives inside the `openclaw/` subdirectory, not the
+repo root, so clone, install, and build from there. After `npm run build`, the
+CLI entrypoint is `openclaw/dist/cli.js`, which is what the `bin` field in
+`openclaw/package.json` points to.
+
+To register the built checkout with OpenClaw's plugin manager, run from the
+`openclaw/` directory:
+
+```sh
 openclaw plugins install ./
 ```
 
 Inside OpenClaw, run `/token-optimizer` for a guided audit with coaching.
+
+> Note: do not use `npx token-optimizer` or `openclaw plugins install
+> token-optimizer`. The npm package name `token-optimizer` is an unrelated
+> project, and `token-optimizer-openclaw` is not published to the npm registry.
+> Run the CLI from this checkout as `node dist/cli.js` (see CLI below).
 
 ## Uninstall
 
@@ -96,24 +106,27 @@ openclaw plugins enable  token-optimizer-openclaw   # re-enable
 
 ## CLI
 
+Run from the `openclaw/` directory after `npm run build`. The CLI entrypoint is
+`dist/cli.js` (the `bin` field in `openclaw/package.json`):
+
 ```sh
-npx token-optimizer detect                                            # Is OpenClaw installed?
-npx token-optimizer scan --days 30                                    # Scan sessions, show usage
-npx token-optimizer audit --days 30                                   # Detect waste, show $ savings
-npx token-optimizer audit --json                                      # JSON output for agents
-npx token-optimizer dashboard                                         # Generate HTML dashboard, open in browser
-npx token-optimizer context                                           # Show context overhead breakdown
-npx token-optimizer context --json                                    # Context audit as JSON
-npx token-optimizer quality                                           # Show quality score (0-100)
-npx token-optimizer quality --json                                    # Quality report as JSON
-npx token-optimizer git-context                                       # Suggest files based on git state
-npx token-optimizer git-context --json                                # Git context as JSON
-npx token-optimizer drift                                             # Check for config drift
-npx token-optimizer drift --snapshot                                  # Capture current config snapshot
-npx token-optimizer validate                                          # Before/after impact comparison
-npx token-optimizer validate --strategy auto --json                   # Auto-split strategy, JSON output
-npx token-optimizer doctor --json                                     # Check checkpoint health, plugin status
-TOKEN_OPTIMIZER_CHECKPOINT_TELEMETRY=1 npx token-optimizer checkpoint-stats  # Checkpoint telemetry summary
+node dist/cli.js detect                                            # Is OpenClaw installed?
+node dist/cli.js scan --days 30                                    # Scan sessions, show usage
+node dist/cli.js audit --days 30                                   # Detect waste, show $ savings
+node dist/cli.js audit --json                                      # JSON output for agents
+node dist/cli.js dashboard                                         # Generate HTML dashboard, open in browser
+node dist/cli.js context                                           # Show context overhead breakdown
+node dist/cli.js context --json                                    # Context audit as JSON
+node dist/cli.js quality                                           # Show quality score (0-100)
+node dist/cli.js quality --json                                    # Quality report as JSON
+node dist/cli.js git-context                                       # Suggest files based on git state
+node dist/cli.js git-context --json                                # Git context as JSON
+node dist/cli.js drift                                             # Check for config drift
+node dist/cli.js drift --snapshot                                  # Capture current config snapshot
+node dist/cli.js validate                                          # Before/after impact comparison
+node dist/cli.js validate --strategy auto --json                  # Auto-split strategy, JSON output
+node dist/cli.js doctor --json                                     # Check checkpoint health, plugin status
+TOKEN_OPTIMIZER_CHECKPOINT_TELEMETRY=1 node dist/cli.js checkpoint-stats  # Checkpoint telemetry summary
 ```
 
 ## Dashboard
@@ -131,7 +144,7 @@ The interactive dashboard has 8 tabs:
 | Daily | Daily cost/token and run count charts with Y-axis labels and custom tooltips |
 | Manage | Toggle skills and MCP servers on/off. Changes accumulate, copy all at once |
 
-Dashboard auto-regenerates on session end. Open manually with `npx token-optimizer dashboard`.
+Dashboard auto-regenerates on session end. Open manually with `node dist/cli.js dashboard` (run from the `openclaw/` directory).
 
 ## Waste Patterns Detected
 
@@ -264,9 +277,9 @@ Checkpoint priority ranking ensures the most important checkpoints (milestones >
 Compare session metrics before and after an optimization:
 
 ```sh
-npx token-optimizer validate                     # Auto-detect split point
-npx token-optimizer validate --strategy halves   # Chronological midpoint
-npx token-optimizer validate --json              # JSON output
+node dist/cli.js validate                     # Auto-detect split point
+node dist/cli.js validate --strategy halves   # Chronological midpoint
+node dist/cli.js validate --json              # JSON output
 ```
 
 Measures: average tokens, cost, messages, and cache hit rate. Reports percentage deltas and a verdict (improved / regressed / no_change).
@@ -274,9 +287,9 @@ Measures: average tokens, cost, messages, and cache hit rate. Reports percentage
 ## Drift Detection
 
 ```sh
-npx token-optimizer drift --snapshot      # Save current state
+node dist/cli.js drift --snapshot      # Save current state
 # ... time passes, skills added, configs changed ...
-npx token-optimizer drift                 # See what changed
+node dist/cli.js drift                 # See what changed
 ```
 
 Tracks: skill count, agent count, SOUL.md/MEMORY.md/AGENTS.md/TOOLS.md size changes, model config changes, cron configs.
@@ -284,8 +297,8 @@ Tracks: skill count, agent count, SOUL.md/MEMORY.md/AGENTS.md/TOOLS.md size chan
 ## Git-Aware Context
 
 ```sh
-npx token-optimizer git-context           # Suggest files based on git state
-npx token-optimizer git-context --json    # JSON output
+node dist/cli.js git-context           # Suggest files based on git state
+node dist/cli.js git-context --json    # JSON output
 ```
 
 Suggests relevant files based on your current git state: test companions, co-changed files, and import chain analysis.

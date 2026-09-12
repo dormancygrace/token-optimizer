@@ -339,6 +339,68 @@ def test_collapse_normalizes_a_wrong_hook_event_name():
     assert_valid_for_both_hosts(json.dumps(payload), "wrong hook event normalized")
 
 
+# The single-object passthrough must stamp the FIRING event, not force
+# SessionStart. Regression for the live UserPromptSubmit failure: "Hook
+# returned incorrect event name: expected 'UserPromptSubmit' but got
+# 'SessionStart'." prompt-continuity emits exactly one object per prompt, so
+# it hits the passthrough; forcing SessionStart there made Claude Code discard
+# the whole UPS hook result. The multi-object merge path was always correct,
+# which is why only the single-object case regressed.
+@pytest.mark.parametrize(
+    "label,raw",
+    [
+        ("single-object-carries-event",
+         '{"continue":true,"hookSpecificOutput":'
+         '{"hookEventName":"UserPromptSubmit","additionalContext":"hint"}}'),
+        ("single-object-missing-event",
+         '{"hookSpecificOutput":{"additionalContext":"hint"}}'),
+        ("multi-object-merge",
+         '{"hookSpecificOutput":'
+         '{"hookEventName":"UserPromptSubmit","additionalContext":"hint"}}\n'
+         '{"systemMessage":"note"}'),
+    ],
+    ids=lambda v: v if isinstance(v, str) and " " not in v else "",
+)
+def test_collapse_stamps_the_firing_event_for_userpromptsubmit(label, raw):
+    import measure
+
+    payload = measure._collapse_hook_stdout(raw, "UserPromptSubmit")
+    assert payload["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    # The exact host check that discarded the live hook: no mismatch error.
+    assert claude_session_start_error(
+        json.dumps(payload), "UserPromptSubmit"
+    ) is None, label
+
+
+# Every emitter path resolves a missing/non-string firing event to SessionStart
+# through the SAME helper, so a future caller passing event=None/"" can never
+# make one path emit a wrong event while another emits a schema-invalid null.
+@pytest.mark.parametrize("bad_event", [None, "", 0, object()], ids=["none", "empty", "zero", "obj"])
+def test_safe_event_falls_back_to_sessionstart_for_bad_events(bad_event):
+    import measure
+
+    assert measure._safe_event(bad_event) == "SessionStart"
+
+
+@pytest.mark.parametrize("bad_event", [None, ""], ids=["none", "empty"])
+def test_collapse_paths_agree_on_sessionstart_for_falsy_events(bad_event):
+    import measure
+
+    single = measure._collapse_hook_stdout(
+        '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"x"}}',
+        bad_event,
+    )
+    multi = measure._collapse_hook_stdout(
+        '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"x"}}\n'
+        '{"systemMessage":"note"}',
+        bad_event,
+    )
+    assert single["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert multi["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert_valid_for_both_hosts(json.dumps(single), "falsy event single")
+    assert_valid_for_both_hosts(json.dumps(multi), "falsy event multi")
+
+
 # --------------------------------------------------------------------------- #
 # 3. End-to-end: every SessionStart entry, run through the real launcher chain
 #    in the environment Codex actually provides, must produce stdout both hosts
@@ -421,17 +483,22 @@ def _run_hook(argv, source: str, home: Path) -> subprocess.CompletedProcess:
     ``CLAUDE_PLUGIN_ROOT`` set, ``CODEX_HOME`` and ``TOKEN_OPTIMIZER_RUNTIME``
     UNSET: that is the environment Codex gives a plugin hook (verified with an
     env-dumping hook), and the environment in which the old runtime-sniffing
-    guard silently did nothing. ``CLAUDE_CONFIG_DIR`` points at a tmp_path so the
-    run never touches the real ~/.claude.
+    guard silently did nothing. Test-only HOME, CLAUDE_CONFIG_DIR, and snapshot
+    overrides keep every config, data, and OS scheduler path inside tmp_path.
     """
     env = dict(os.environ)
     for var in ("CODEX_HOME", "TOKEN_OPTIMIZER_RUNTIME", "CLAUDE_PLUGIN_DATA",
                 "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID",
-                "AI_AGENT", "CLAUDE_CODE_REMOTE", "CLAUDE_CODE_CONTAINER_ID",
-                "TOKEN_OPTIMIZER_SNAPSHOT_DIR"):
+                "AI_AGENT", "CLAUDE_CODE_REMOTE", "CLAUDE_CODE_CONTAINER_ID"):
         env.pop(var, None)
     env["CLAUDE_PLUGIN_ROOT"] = str(REPO)
     env["CLAUDE_CONFIG_DIR"] = str(home)
+    # ensure-health dispatches a detached daemon-revive child. Isolate both
+    # path families it can mutate: config under CLAUDE_CONFIG_DIR and OS
+    # scheduler artifacts under HOME. The snapshot override also activates the
+    # production sandbox guard, so launchctl/systemd/schtasks cannot be called.
+    env["HOME"] = str(home.parent)
+    env["TOKEN_OPTIMIZER_SNAPSHOT_DIR"] = str(home / "token-optimizer")
     payload = json.dumps({
         "cwd": str(REPO),
         "hook_event_name": "SessionStart",

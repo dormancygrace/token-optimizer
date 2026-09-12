@@ -81,6 +81,8 @@ def m(monkeypatch):
         del sys.modules["measure"]
     mod = importlib.import_module("measure")
     importlib.reload(mod)
+    # OS runners/installers are stubbed below; keep their pure orchestration testable.
+    monkeypatch.setattr(mod, "_daemon_snapshot_sandboxed", lambda: False)
     monkeypatch.setattr(mod, "_is_foreign_runtime", lambda: False)
     monkeypatch.setattr(mod, "detect_runtime", lambda: "claude")
     # The legacy daemon dir derives from RUNTIME_DIR (the REAL ~/.claude, not

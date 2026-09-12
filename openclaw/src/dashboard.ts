@@ -10,10 +10,78 @@ import * as path from "path";
 import { AgentRun, WasteFinding, AuditReport, totalTokens, billableTokens, Severity, CostlyPrompt } from "./models";
 import { QualityReport, contextWindowForModel, scoreSessionQuality, scoreToGrade } from "./quality";
 import { ContextAudit, SkillDetail, McpServer, ManageData } from "./context-audit";
-import type { RealizedSavings, SavingsEventsSummary } from "./savings";
+import type { RealizedSavings, SavingsEventsSummary, SavingsEventsWindow } from "./savings";
 import { readSavingsEventsByCategory } from "./savings";
 import { loadPricingTier, PRICING_TIER_LABELS, getPricing, normalizeModelName } from "./pricing";
 import { CoachData } from "./coach";
+
+// ---------------------------------------------------------------------------
+// Version labels (Core + adapter)
+// ---------------------------------------------------------------------------
+
+/**
+ * Core Token Optimizer dashboard version. The canonical Python dashboard reads
+ * this from `.claude-plugin/plugin.json` at runtime; the OpenClaw adapter mirrors
+ * that by walking up from this module to find the same manifest. When the
+ * manifest is absent (skill-only install, test sandbox), falls back to the
+ * compiled-in constant so the label is never blank.
+ */
+const CORE_VERSION_FALLBACK = "5.13.10";
+
+/**
+ * OpenClaw adapter version. Source of truth is `openclaw/package.json`; the
+ * fallback covers test sandboxes where the manifest is not reachable.
+ */
+const ADAPTER_VERSION_FALLBACK = "2.4.21";
+
+function readManifestVersion(manifestPath: string, fallback: string): string {
+  try {
+    const raw = fs.readFileSync(manifestPath, "utf-8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const v = parsed.version;
+    if (typeof v === "string" && v.trim()) return v.trim();
+  } catch {
+    /* manifest missing or unparseable — use fallback */
+  }
+  return fallback;
+}
+
+/**
+ * Walk up from this file's directory to find the core plugin manifest
+ * (`.claude-plugin/plugin.json`) and the OpenClaw adapter manifest
+ * (`openclaw/package.json`). Returns the compiled-in fallbacks when the
+ * manifests are not found, so the version label is always present.
+ */
+function resolveVersionLabels(): { coreVersion: string; adapterVersion: string } {
+  let coreVersion = CORE_VERSION_FALLBACK;
+  let adapterVersion = ADAPTER_VERSION_FALLBACK;
+  try {
+    // __dirname at runtime is openclaw/dist (compiled) or openclaw/src (bun).
+    // Walk up to find both manifests.
+    let dir = __dirname;
+    for (let i = 0; i < 6; i++) {
+      const coreManifest = path.join(dir, ".claude-plugin", "plugin.json");
+      const adapterManifest = path.join(dir, "openclaw", "package.json");
+      try {
+        if (coreVersion === CORE_VERSION_FALLBACK && fs.existsSync(coreManifest)) {
+          coreVersion = readManifestVersion(coreManifest, CORE_VERSION_FALLBACK);
+        }
+      } catch { /* not found, keep walking */ }
+      try {
+        if (adapterVersion === ADAPTER_VERSION_FALLBACK && fs.existsSync(adapterManifest)) {
+          adapterVersion = readManifestVersion(adapterManifest, ADAPTER_VERSION_FALLBACK);
+        }
+      } catch { /* not found, keep walking */ }
+      if (coreVersion !== CORE_VERSION_FALLBACK && adapterVersion !== ADAPTER_VERSION_FALLBACK) break;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    /* filesystem walk failed — use fallbacks */
+  }
+  return { coreVersion, adapterVersion };
+}
 
 // ---------------------------------------------------------------------------
 // Data interfaces
@@ -46,6 +114,10 @@ export interface DashboardData {
   coach: CoachData | null;
   savings: RealizedSavings | null;
   savingsEvents: SavingsEventsSummary;
+  /** Core Token Optimizer dashboard version (from .claude-plugin/plugin.json). */
+  coreVersion: string;
+  /** Independent OpenClaw adapter version (from openclaw/package.json). */
+  adapterVersion: string;
 }
 
 interface OverviewData {
@@ -330,6 +402,16 @@ export function buildDashboardData(
   const pricingTier = loadPricingTier();
   const pricingTierLabel = PRICING_TIER_LABELS[pricingTier] ?? pricingTier;
 
+  const { coreVersion, adapterVersion } = resolveVersionLabels();
+
+  // F7: window the savings-events read to the dashboard's scan period so the
+  // measured-floor action card shows actual Last N days events, not lifetime.
+  // Mirrors the canonical Python `_get_savings_summary(days=days)` which filters
+  // `timestamp >= now - days`. The windowed read aligns SAVED to the same
+  // period as SPENT (daysScanned), so the action card's measured/estimated
+  // action dollars reflect the actual period, not an unbounded lifetime sum.
+  const savingsWindow: SavingsEventsWindow = { days: report.daysScanned, now: Date.now() };
+
   return {
     generatedAt: new Date().toISOString(),
     daysScanned: report.daysScanned,
@@ -362,7 +444,9 @@ export function buildDashboardData(
     pricingTierLabel,
     coach,
     savings,
-    savingsEvents: readSavingsEventsByCategory(),
+    savingsEvents: readSavingsEventsByCategory(undefined, savingsWindow),
+    coreVersion,
+    adapterVersion,
   };
 }
 
@@ -472,7 +556,7 @@ function renderNav(data: DashboardData): string {
 
   return `<nav class="nav-col">
     <div>
-      <div class="brand"><span></span> Token Optimizer</div>
+      <div class="brand"><span></span> Token Optimizer <small class="brand-meta">Core v${esc(data.coreVersion)} &middot; OpenClaw v${esc(data.adapterVersion)}</small></div>
       <div class="nav-menu">
         <a class="nav-item active" data-view="overview">Overview</a>
         <a class="nav-item" data-view="savings">Savings</a>
@@ -682,9 +766,9 @@ function renderTokensSavedCard(data: DashboardData): string {
 
   // Pool 2: savings_events (measured categories only, excluding estimated tier).
   // readSavingsEventsByCategory is already imported at the top of this module.
-  // data.savingsEvents is pre-computed in buildDashboardData but is NOT windowed
-  // to daysScanned — it reads all events. We re-read with a window here to align
-  // SAVED to the same window as SPENT.
+  // data.savingsEvents is now windowed to daysScanned in buildDashboardData (F7),
+  // but this pool re-reads with the renderSavings local `days` to align SAVED to
+  // the same window as SPENT for the Tokens Saved card computation.
   let savingsEventsTokens = 0;
   try {
     const windowed = readSavingsEventsByCategory(undefined, { days, now: Date.now() });
@@ -1834,12 +1918,17 @@ function renderSidebar(data: DashboardData): string {
 
     <div class="section-title">Quick Commands</div>
     <div style="font-family:var(--font-mono);font-size:12px;line-height:2">
-      <div class="quick-cmd">npx token-optimizer scan</div>
-      <div class="quick-cmd">npx token-optimizer audit</div>
-      <div class="quick-cmd">npx token-optimizer context</div>
-      <div class="quick-cmd">npx token-optimizer quality</div>
-      <div class="quick-cmd">npx token-optimizer drift</div>
-      <div class="quick-cmd">npx token-optimizer dashboard</div>
+      <div class="quick-cmd">node dist/cli.js scan</div>
+      <div class="quick-cmd">node dist/cli.js audit</div>
+      <div class="quick-cmd">node dist/cli.js context</div>
+      <div class="quick-cmd">node dist/cli.js quality</div>
+      <div class="quick-cmd">node dist/cli.js drift</div>
+      <div class="quick-cmd">node dist/cli.js dashboard</div>
+    </div>
+
+    <div class="regen-note">
+      <div class="regen-note-title">Static dashboard</div>
+      <div class="regen-note-desc">This page is a static snapshot. From the Token Optimizer openclaw source checkout, build then run <code>node dist/cli.js dashboard</code>. It also auto-refreshes on session end.</div>
     </div>
 
     <div class="version-footer">
@@ -2036,6 +2125,16 @@ h1, h2, h3, h4 { font-weight: 400; }
   border-radius: 2px;
   display: inline-block;
   box-shadow: var(--glow-sm);
+}
+.brand-meta {
+  display: block;
+  margin-left: 27px;
+  margin-top: 2px;
+  font-size: 11px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+  font-weight: 600;
 }
 .nav-menu { display: flex; flex-direction: column; gap: 2px; }
 .nav-item {
@@ -2650,6 +2749,18 @@ h1, h2, h3, h4 { font-weight: 400; }
   justify-content: center;
   align-items: center;
 }
+.regen-note {
+  margin-top: var(--s-3);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  background: var(--c-surface);
+  font-size: 12px;
+  color: var(--c-text-dim);
+}
+.regen-note-title { font-weight: 600; color: var(--c-text-main); margin-bottom: 4px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+.regen-note-desc { line-height: 1.5; }
+.regen-note code { font-family: var(--font-mono); color: var(--c-accent-cyan); font-size: 11px; }
 .version-footer a { color: var(--c-accent-cyan); text-decoration: none; }
 .version-footer .footer-byline { opacity: 0.45; }
 .social-icons { display: flex; gap: 14px; align-items: center; }

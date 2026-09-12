@@ -37,6 +37,7 @@ import sys
 import tempfile
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -162,6 +163,8 @@ def test_non_wsl_mnt_rejected_with_warning():
     tmp = Path(tempfile.mkdtemp(prefix="t_nonwsl_mnt_"))
     mnt = _make_mnt_tree(tmp, "mnt")
     copilot_dir = _make_mnt_tree(mnt, "c/Users/asaf/.copilot")
+    # Keep the simulated mount outside HOME even when TMPDIR is under HOME.
+    home = _make_mnt_tree(tmp, "home")
 
     def body(mnt_root):
         os.environ["COPILOT_HOME"] = str(copilot_dir)
@@ -174,7 +177,8 @@ def test_non_wsl_mnt_rejected_with_warning():
         assert "rejected" in buf.getvalue().lower(), \
             f"non-WSL /mnt must warn, got: {buf.getvalue()!r}"
 
-    _with_env(wsl=False, mnt_root=mnt, fn=body)
+    with patch.object(Path, "home", return_value=home):
+        _with_env(wsl=False, mnt_root=mnt, fn=body)
 
 
 def test_non_wsl_mnt_helper_returns_none():

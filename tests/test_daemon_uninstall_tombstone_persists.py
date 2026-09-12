@@ -82,12 +82,28 @@ def _seed_identity(snap_dir: Path) -> None:
 def _run_uninstall(measure, monkeypatch, snap_dirs, this_install_only=False):
     """Drive the launchd uninstaller with the identity sweep stubbed to
     `snap_dirs` and every OS call neutralized."""
+    launch_agents = snap_dirs[0].parent / "LaunchAgents"
+    launch_agents.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(measure, "LAUNCH_AGENTS_DIR", launch_agents)
+    monkeypatch.setattr(
+        measure,
+        "PLIST_PATH",
+        launch_agents / "com.token-optimizer.dashboard.plist",
+    )
     monkeypatch.setattr(
         measure, "_daemon_identity_snapshot_dirs",
         lambda only: [snap_dirs[0]] if only else list(snap_dirs),
     )
     monkeypatch.setattr(measure, "_ALL_LAUNCH_AGENT_LABELS", ())
+    monkeypatch.setattr(
+        measure.subprocess,
+        "run",
+        lambda *a, **k: measure.subprocess.CompletedProcess(a, 1),
+    )
     monkeypatch.setattr(measure, "_reclaim_posix_daemon_port", lambda *a, **k: None)
+    # Exercise the low-level helper only after every OS path and process call
+    # is contained above. Production snapshot sandboxes keep this guard on.
+    monkeypatch.setattr(measure, "_daemon_snapshot_sandboxed", lambda: False)
     measure._uninstall_launchd_daemon(this_install_only=this_install_only)
 
 
@@ -236,11 +252,25 @@ def test_uninstall_reclaims_the_daemon_port(measure, tmp_path, monkeypatch):
     monkeypatch.setattr(
         measure, "_daemon_identity_snapshot_dirs", lambda only: [active]
     )
+    launch_agents = tmp_path / "LaunchAgents"
+    launch_agents.mkdir()
+    monkeypatch.setattr(measure, "LAUNCH_AGENTS_DIR", launch_agents)
+    monkeypatch.setattr(
+        measure,
+        "PLIST_PATH",
+        launch_agents / "com.token-optimizer.dashboard.plist",
+    )
     monkeypatch.setattr(measure, "_ALL_LAUNCH_AGENT_LABELS", ())
+    monkeypatch.setattr(
+        measure.subprocess,
+        "run",
+        lambda *a, **k: measure.subprocess.CompletedProcess(a, 1),
+    )
     monkeypatch.setattr(
         measure, "_reclaim_posix_daemon_port",
         lambda port=measure.DAEMON_PORT, **k: ports.append(port),
     )
+    monkeypatch.setattr(measure, "_daemon_snapshot_sandboxed", lambda: False)
 
     measure._uninstall_launchd_daemon()  # default = sweep all identities
 

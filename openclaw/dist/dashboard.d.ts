@@ -35,11 +35,16 @@ export interface DashboardData {
     coach: CoachData | null;
     savings: RealizedSavings | null;
     savingsEvents: SavingsEventsSummary;
+    /** Core Token Optimizer dashboard version (from .claude-plugin/plugin.json). */
+    coreVersion: string;
+    /** Independent OpenClaw adapter version (from openclaw/package.json). */
+    adapterVersion: string;
 }
 interface OverviewData {
     totalRuns: number;
     totalCost: number;
     totalTokens: number;
+    totalBillableTokens: number;
     allCostZero: boolean;
     monthlySavings: number;
     wasteCount: number;

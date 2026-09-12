@@ -49,10 +49,13 @@ This module keeps runtime integration deliberately simple:
   ladder. So ``detect_runtime()`` still returns ``"claude"`` inside Cowork.
   ``is_cowork()`` is a REFINEMENT signal exposed alongside it (mirroring how the
   runtime lattice layers signals rather than adding runtimes) — true when the
-  Cowork host markers are present: ``CLAUDE_CODE_CONTAINER_ID`` (primary), a
-  synced-plugin ``CLAUDE_PLUGIN_ROOT`` under ``/plugins/synced/``, or ``AI_AGENT``
-  carrying the harness marker. Callers that need Cowork-specific behaviour read
-  ``is_cowork()``; nothing about the existing ``detect_runtime()`` returns changes.
+  Cowork host markers are present: ``CLAUDE_CODE_REMOTE`` (primary, documented),
+  ``CLAUDE_CODE_CONTAINER_ID`` (observed), or a synced-plugin
+  ``CLAUDE_PLUGIN_ROOT`` under ``/plugins/synced/``. ``AI_AGENT`` is deliberately
+  NOT a signal: native Claude Code also sets ``AI_AGENT=claude-code_*_harness``,
+  so the harness marker is ambiguous and would false-positive on the local CLI.
+  Callers that need Cowork-specific behaviour read ``is_cowork()``; nothing about
+  the existing ``detect_runtime()`` returns changes.
 - Callers can keep legacy variable names while resolving to the correct home.
 
 The goal is to let Token Optimizer share one Python core while platform
@@ -98,16 +101,15 @@ _CLAUDE_PLUGIN_ENVS = ("CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA")
 #     (code.claude.com/docs/en/hooks.md: "$CLAUDE_CODE_REMOTE is set to 'true'
 #     in cloud, unset locally"; docs-grounding.md §3). Primary signal.
 #   - CLAUDE_CODE_CONTAINER_ID: set inside every Cowork VM (observed, undocumented).
-#   - AI_AGENT: the Cowork VM sets the "_harness" variant
-#     ("claude-code_2-1-231_harness"); the LOCAL Claude Code CLI sets the
-#     "_agent" variant ("claude-code_2-1-229_agent"). So the distinguishing
-#     token is "harness", NOT the bare "claude-code" prefix (which both share).
 #   - CLAUDE_PLUGIN_ROOT under /plugins/synced/: Cowork plugins arrive via the
 #     org admin console account-sync, landing under a synced-plugin path.
+#   - AI_AGENT is deliberately NOT consulted: native Claude Code (local CLI) also
+#     sets AI_AGENT=claude-code_<version>_harness, so the "_harness" marker is
+#     ambiguous between Cowork and desktop. Treating it as a Cowork signal caused
+#     is_cowork() false-positives on every native hook subprocess (which inherits
+#     AI_AGENT). See test_is_cowork_native_ai_agent_harness_is_not_cowork.
 _COWORK_REMOTE_ENV = "CLAUDE_CODE_REMOTE"
 _COWORK_CONTAINER_ENV = "CLAUDE_CODE_CONTAINER_ID"
-_COWORK_AI_AGENT_ENV = "AI_AGENT"
-_COWORK_AI_AGENT_MARKERS = ("claude-code", "harness")
 _COWORK_SYNCED_PLUGIN_MARKER = "/plugins/synced/"
 # Claude Code's own process-env signals. CLAUDECODE is inherited by every
 # subprocess Claude Code spawns, so a genuine Codex/OpenCode/Copilot launched
@@ -1164,13 +1166,17 @@ def is_cowork() -> bool:
          (code.claude.com/docs/en/hooks.md; docs-grounding.md §3). Primary.
       2. ``CLAUDE_CODE_CONTAINER_ID`` is set (observed in every Cowork VM;
          undocumented). Belt-and-suspenders fallback.
-      3. ``AI_AGENT`` carries the Claude Code VM harness marker
-         (``claude-code`` + ``harness``, e.g. ``claude-code_2-1-231_harness``);
-         the local CLI's ``..._agent`` value is deliberately NOT a match.
-      4. ``CLAUDE_PLUGIN_ROOT``/``CLAUDE_PLUGIN_DATA`` points under
+      3. ``CLAUDE_PLUGIN_ROOT``/``CLAUDE_PLUGIN_DATA`` points under
          ``/plugins/synced/`` — where org-console account-synced plugins land.
 
-    Doc vs observed: only (1) is in the published docs; (2)-(4) are live-observed
+    ``AI_AGENT`` is intentionally NOT a signal. Native Claude Code (the local
+    CLI) also exports ``AI_AGENT=claude-code_<version>_harness`` into every hook
+    subprocess, so the ``_harness`` marker is ambiguous between Cowork and
+    desktop. Matching on it caused is_cowork() false-positives on every native
+    hook fire (see PR #142's compact-restore workaround, which papered over the
+    symptom; this removes the root cause).
+
+    Doc vs observed: only (1) is in the published docs; (2)-(3) are live-observed
     Cowork markers kept as fallback so detection still holds if a future build
     stops exporting CLAUDE_CODE_REMOTE into the hook env (Claude Code does
     not guarantee env injection). Never raises; a missing/blank env just
@@ -1179,9 +1185,6 @@ def is_cowork() -> bool:
     if _truthy_env(_COWORK_REMOTE_ENV):
         return True
     if os.environ.get(_COWORK_CONTAINER_ENV, "").strip():
-        return True
-    ai_agent = os.environ.get(_COWORK_AI_AGENT_ENV, "").lower()
-    if all(marker in ai_agent for marker in _COWORK_AI_AGENT_MARKERS):
         return True
     for env_var in _CLAUDE_PLUGIN_ENVS:
         val = os.environ.get(env_var, "")

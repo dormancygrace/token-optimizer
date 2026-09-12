@@ -42,7 +42,8 @@ from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
 
-# Verbs that write host state: settings.json, launchd/systemd/schtasks units,
+# Verbs and hook entrypoints that write host state: settings.json,
+# launchd/systemd/schtasks units,
 # a runtime's host config dir (~/.codex etc.), or the plugin manifests. Matched
 # as CLI arguments, not as prose in a docstring.
 #   - cleanup / setup-* / *-uninstall / --uninstall : original set
@@ -50,8 +51,10 @@ TESTS_DIR = Path(__file__).resolve().parent
 #     sibling runtime's HOME-derived host config
 #   - keepwarm-scheduler : installs/removes a launchd/systemd/schtasks unit
 #     under HOME (keepwarm-scheduler install|uninstall)
+#   - ensure-health / consolidated prompt runners: dispatch daemon-revive,
+#     which can install or restart the OS scheduler artifact indirectly
 _DESTRUCTIVE = re.compile(
-    r"""["'](?:cleanup|setup-[a-z-]+|[a-z-]+-uninstall|[a-z-]+-install|keepwarm-scheduler)["']|["']--uninstall["']"""
+    r"""["'](?:cleanup|ensure-health|setup-[a-z-]+|[a-z-]+-uninstall|[a-z-]+-install|keepwarm-scheduler)["']|["']--uninstall["']|["']hooks/(?:sessionstart|userpromptsubmit)_runner\.py["']"""
 )
 _SPAWNS = re.compile(r"subprocess\.(?:run|Popen|check_output|call)")
 _PINS_CONFIG = "CLAUDE_CONFIG_DIR"
@@ -62,7 +65,13 @@ _PINS_CONFIG = "CLAUDE_CONFIG_DIR"
 _PINS_HOME = re.compile(r"""["']HOME["']""")
 
 # This guard file itself names the verbs in prose/regex; exempt by name.
-_EXEMPT = {"test_host_safety_guard.py"}
+_EXEMPT = {
+    "test_host_safety_guard.py",
+    # These subprocesses import a path probe or a generated stub. They never
+    # execute the real hook command whose name also appears in the file.
+    "test_cowork_hardening.py",
+    "test_hook_entry_budgets.py",
+}
 
 
 def _offenders() -> list[str]:
@@ -154,3 +163,22 @@ def test_guard_catches_scheduler_and_runtime_install_verbs(tmp_path, monkeypatch
         )
         monkeypatch.setattr(__import__("sys").modules[__name__], "TESTS_DIR", tmp_path)
         assert _offenders() == ["test_verb.py"], verb
+
+
+def test_guard_catches_ensure_health_and_consolidated_runners(tmp_path, monkeypatch):
+    """Session hooks can register the daemon indirectly via daemon-revive."""
+    cases = (
+        "'measure.py', 'ensure-health'",
+        "'hooks/sessionstart_runner.py'",
+        "'hooks/userpromptsubmit_runner.py'",
+    )
+    for argv in cases:
+        planted = tmp_path / "test_hook_entry.py"
+        planted.write_text(
+            "import subprocess, sys\n"
+            "def test_x():\n"
+            f"    subprocess.run([sys.executable, {argv}])\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(__import__("sys").modules[__name__], "TESTS_DIR", tmp_path)
+        assert _offenders() == ["test_hook_entry.py"], argv
