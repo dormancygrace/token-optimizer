@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 import heapq
 import json
+import sqlite3
 import re
 from collections import deque
 from datetime import datetime, timezone
@@ -323,9 +324,24 @@ def _project_name_from_file(path: Path) -> str:
 
 def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
     try:
-        incomplete = Path(filepath).stat().st_size > MAX_PARSE_FILE_BYTES
+        large = Path(filepath).stat().st_size > MAX_PARSE_FILE_BYTES
     except OSError:
         return None
+    if large:
+        try:
+            import codex_log_index
+            records, info = codex_log_index.records(filepath)
+            result = _parse_session_records(records, incomplete=info['incomplete'])
+            if result:
+                result.update(info)
+            return result
+        except (OSError, ValueError, sqlite3.Error):
+            # Contention must not stall a hook. A tail fallback remains labelled.
+            return _parse_session_records(_iter_json_records(filepath), incomplete=True, sampled=True)
+    return _parse_session_records(_iter_json_records(filepath))
+
+
+def _parse_session_records(records, incomplete=False, sampled=False):
     skills_used: dict[str, int] = {}
     subagents_used: dict[str, int] = {}
     tool_calls: dict[str, int] = {}
@@ -351,7 +367,7 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
     task_durations_ms: list[float] = []
     ttft_ms: list[float] = []
 
-    for record in _iter_json_records(filepath):
+    for record in records:
         payload = _payload(record)
         payload_type = payload.get("type")
 
@@ -388,7 +404,7 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
                 if previous_usage and usage['input_tokens'] >= previous_usage['input_tokens']:
                     turn_usage = {k: max(0, usage[k] - previous_usage[k])
                                   for k in ('input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_output_tokens')}
-                elif not incomplete or previous_usage:
+                elif not sampled or previous_usage:
                     turn_usage = usage
                 elif not info.get('last_token_usage'):
                     turn_usage = None
@@ -423,14 +439,15 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
 
         elif payload_type in {"user_message", "message", "agent_message"}:
             text = _extract_text(payload)
+            text_chars = payload.get('_optimizer_chars', len(text))
             role = payload.get("role")
             if payload_type == "user_message" or role == "user":
                 topic = topic or _extract_topic(text)
-                input_text_chars += len(text)
+                input_text_chars += text_chars
             elif payload_type == "agent_message" or role == "assistant":
-                output_text_chars += len(text)
+                output_text_chars += text_chars
             else:
-                input_text_chars += len(text)
+                input_text_chars += text_chars
             message_count += 1
 
         elif payload_type in {"function_call", "custom_tool_call"}:
@@ -444,9 +461,9 @@ def parse_session_jsonl(filepath: str | Path) -> dict[str, Any] | None:
                 subagents_used[agent_type] = subagents_used.get(agent_type, 0) + 1
 
         elif payload_type in {"function_call_output", "custom_tool_call_output"}:
-            tool_output_chars += len(str(payload.get("output") or ""))
+            tool_output_chars += payload.get('_optimizer_output_chars', len(str(payload.get("output") or "")))
         elif payload_type in {"exec_command_end", "patch_apply_end"}:
-            tool_output_chars += len(_event_output_text(payload))
+            tool_output_chars += payload.get('_optimizer_output_chars', len(_event_output_text(payload)))
             _append_duration(tool_durations_ms, payload.get("duration"))
         elif payload_type == "mcp_tool_call_end":
             _append_duration(tool_durations_ms, payload.get("duration"))

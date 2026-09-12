@@ -10,7 +10,7 @@ Token Optimizer for Codex audits local Codex context usage, tracks real session 
 
 ## Status
 
-Token Optimizer supports Codex with a Codex-native adapter. Core audit, coaching, dashboard, cost tracking, continuity, and fleet scanning work today. A few Claude Code mechanisms depend on hook APIs Codex does not expose yet, so those are implemented as Codex-safe equivalents or listed as explicit upstream gaps in the [Feature Parity](#feature-parity) table below.
+Token Optimizer supports Codex with a Codex-native adapter. Core audit, coaching, dashboard, cost tracking, continuity, and fleet scanning work today. Some Claude Code mechanisms need separate Codex adapters or telemetry, as documented in the [Feature Parity](#feature-parity) table below.
 
 ## Install
 
@@ -27,26 +27,33 @@ Then in the Codex TUI: `/plugins` and install Token Optimizer.
 **After install, set up hooks globally (one-time):**
 
 ```bash
-TOKEN_OPTIMIZER_RUNTIME=codex python3 skills/token-optimizer/scripts/measure.py codex-install
+TOKEN_OPTIMIZER_RUNTIME=codex python3 skills/token-optimizer/scripts/measure.py codex-install --profile balanced --enable-bash-compression
 ```
 
-This installs hooks to `~/.codex/hooks.json`, which Codex loads for all projects regardless of trust level. For per-project overrides, use `--project "$PWD"` instead.
+Run this from the installed plugin directory. On Windows PowerShell, set `$env:TOKEN_OPTIMIZER_RUNTIME="codex"` first, then run the Python command without the POSIX environment prefix.
 
-The default profile is `balanced`. It installs:
+This installs native OS-specific hooks to `~/.codex/hooks.json` for all projects. Codex must review new or changed hook commands before executing them. The Codex manifest disables the inherited Claude Bash hook bundle to prevent duplicate, incompatible handlers. For per-project overrides, use `--project "$PWD"` instead.
+
+The recommended `balanced` profile installs:
 
 - `SessionStart` for session recovery context.
 - `UserPromptSubmit` for prompt-quality and loop nudges.
 - `Stop` for throttled dashboard refresh and continuity checkpointing.
+- `PreCompact` and `Interrupt` for checkpoints; `PostCompact` for context refresh.
+- `SubagentStart` and `SubagentStop` for task-specific tracking.
+- Optional `PreToolUse` command compression with `--enable-bash-compression`.
 - Codex compact prompt guidance in `~/.codex/config.toml`.
 
 ### Hook profiles
 
 | Profile | What it installs | Noise level |
 |---------|-----------------|-------------|
-| `balanced` (default) | SessionStart + UserPromptSubmit + Stop + compact prompt | Low, 3 hook events |
-| `quiet` | Stop only | Minimal, 1 hook event |
-| `telemetry` | Balanced + PostToolUse | Medium, visible rows in Desktop |
-| `aggressive` | All hooks including experimental Bash PreToolUse | High, full coverage |
+| `balanced` | SessionStart, UserPromptSubmit, Stop, compaction/interrupt and subagent events | 8 events |
+| `quiet` | Stop only | 1 event |
+| `telemetry` | Stop + PostToolUse | Tool-result telemetry |
+| `aggressive` (installer default) | Balanced + PostToolUse | Full telemetry |
+
+Command compression is a separate opt-in on every profile. It rewrites eligible inspection commands through Codex `updatedInput`, executes once, preserves failures and warnings, and links to the full original output. Write-capable commands and outputs above 8 MiB pass through unchanged.
 
 ```bash
 TOKEN_OPTIMIZER_RUNTIME=codex python3 skills/token-optimizer/scripts/measure.py codex-install --profile quiet
@@ -142,7 +149,7 @@ These features work identically on Claude Code and Codex:
 
 | Feature | Details |
 |---------|---------|
-| v6 dual-score quality scoring | Resource Health plus Session Efficiency, with Codex-calibrated GPT-5.x long-context curves. |
+| v6 dual-score quality scoring | Resource Health plus Session Efficiency, using context headroom and observed waste. These are resource heuristics, not measured model accuracy. |
 | Quality grades | S/A/B/C/D/F grades in dashboard, coach, CLI, and status line |
 | Session continuity | Checkpoints preserve decisions, files, errors, and next step across compaction and session boundaries |
 | Dashboard | Single-file HTML with per-turn token breakdown, cache analysis, cost tracking, quality overlays. Codex-native paths and copy |
@@ -163,33 +170,36 @@ Codex and Claude Code have different hook surfaces, so some features work differ
 | Config file | `CLAUDE.md` | `AGENTS.md` | Different platforms |
 | Memory system | `MEMORY.md` + project memory dirs | `~/.codex/memories/**/*.md` | Different storage |
 | Model routing advice | Opus/Sonnet/Haiku per-agent routing | Intelligence levels (Low/Medium/High/Extra High) + model selection (GPT-5.6 Sol/Terra/Luna, GPT-5.5, 5.4, 5.4-Mini, 5.3-Codex, 5.2) | Different model families |
-| Hook install | Auto via plugin, 8 hook events | `codex-install` command (global by default), 4 profiles, 3-5 hook events | Codex hooks are newer, fewer events |
-| Compact lifecycle | PreCompact + PostCompact hooks capture/restore | Compact prompt guidance + Stop checkpoints | Codex lacks PreCompact/PostCompact |
+| Hook install | Auto via plugin, 8 hook events | `codex-install` command (global by default), native Windows/POSIX launchers | Explicit OS-specific setup |
+| Compact lifecycle | PreCompact + PostCompact hooks capture/restore | PreCompact checkpoints, PostCompact refresh, SessionStart recovery | Native Codex lifecycle events |
 | Tool result archive | PostToolUse archives immediately per tool call | Stop-time backfill from JSONL (balanced), or PostToolUse (telemetry profile) | Different timing |
 | Dashboard refresh | SessionEnd hook + daemon at `localhost:24842` | Stop hook + daemon at `localhost:24843` | Both support bookmarkable URL via `setup-daemon` |
 | Plugin install | `/plugin marketplace add alexgreensh/token-optimizer` | `codex plugin marketplace add alexgreensh/token-optimizer` | Same concept, different CLI |
 | Auto-update | Claude Code marketplace auto-update | Codex marketplace `git ls-remote` on startup | Both work |
 
-### Upstream Codex API gaps
+### Remaining adapter and telemetry limits
 
-These Claude Code mechanisms need Codex API changes before they can work identically:
+These mechanisms are not claimed as active Codex features:
 
 | Feature | Claude Code | Codex | Blocker |
 |---------|------------|-------|---------|
-| Delta read substitution | PreToolUse Read returns diff instead of full file | Not active | Codex PreToolUse Read hook doesn't support `updatedInput` |
+| Delta read substitution | PreToolUse Read returns diff instead of full file | Not active | No Codex adapter for arbitrary file-read commands/tools |
 | Structure-map substitution | PreToolUse Read returns AST skeleton for re-reads | Not active | Same blocker |
-| Invisible Bash compression | PreToolUse Bash rewrites commands transparently | Experimental opt-in only | Codex hooks can't rewrite tool input silently |
 | Cache-write TTL breakdowns | Full 1h/5m cache-write split visible | Cached input shown, no TTL split | Codex logs don't expose cache-write TTL fields |
-| StopFailure recovery | Dedicated hook fires on crash/timeout | Approximated with Stop + compact prompt | No StopFailure hook in Codex |
+| StopFailure recovery | Dedicated hook fires on crash/timeout | Stop + Interrupt checkpoints + compact prompt | No StopFailure hook in Codex |
 | Skill usage telemetry | Per-skill invocation tracking from trends | Partial, limited log signals | Codex logs don't expose all skill invocation events |
 
 ## Codex Models and Pricing
 
-Token Optimizer tracks costs for all Codex models:
+Model availability, reasoning options and effective context limits come from the local Codex model catalog, including Astra, Sol, Terra, Luna, Daybreak, GPT-5.5 and Spark when available. Actual task-reported limits take precedence. Unknown prices remain unavailable.
+
+Large transcripts are indexed incrementally from the beginning with bounded memory. Pending files are revisited even without new writes. Incomplete or malformed data is labeled explicitly. Cached input and reasoning are inclusive subsets, not added twice.
+
+Optional API-price comparisons for supported historical models:
 
 | Model | Input ($/1M) | Cached ($/1M) | Output ($/1M) |
 |-------|-------------|---------------|---------------|
-| GPT-5.6 Sol | $5.00 | $0.50 | $30.00 |
+| GPT-5.6 Sol | $4.00 | $0.40 | $20.00 |
 | GPT-5.6 Terra | $2.00 | $0.20 | $12.00 |
 | GPT-5.6 Luna | $0.20 | $0.02 | $1.20 |
 | GPT-5.5 | $5.00 | $0.50 | $30.00 |

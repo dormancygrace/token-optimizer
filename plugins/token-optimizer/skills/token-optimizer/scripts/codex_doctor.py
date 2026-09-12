@@ -27,8 +27,9 @@ SUPPORTED_HOOK_EVENTS = {
     "Stop",
     "SubagentStart",
     "SubagentStop",
+    "PreCompact", "PostCompact", "Interrupt", "SessionEnd",
 }
-BASH_ONLY_EVENTS = {"PreToolUse", "PermissionRequest", "PostToolUse"}
+BASH_ONLY_EVENTS = set()  # Current Codex also exposes apply_patch, MCP and local function tools.
 REQUIRED_FILES = (
     ".codex-plugin/plugin.json",
     "hooks/python-launcher.sh",
@@ -36,6 +37,8 @@ REQUIRED_FILES = (
     "skills/token-optimizer/scripts/codex_hook_bridge.py",
     "skills/token-optimizer/scripts/codex_session.py",
     "skills/token-optimizer/scripts/codex_models.py",
+    "skills/token-optimizer/scripts/codex_log_index.py",
+    "skills/token-optimizer/scripts/codex_command_compress.py",
     "skills/token-optimizer/scripts/codex_compact_prompt.py",
     "skills/token-optimizer/scripts/codex_statusline.py",
     "skills/token-optimizer/scripts/codex_install.py",
@@ -326,7 +329,7 @@ def _project_feature_checks(project: Path) -> list[dict[str, str]]:
             if isinstance(groups, list):
                 hooks[event] = list(hooks.get(event, [])) + groups
     checks = []
-    if _has_project_hook(hooks, "PreToolUse", "Bash", "bash_hook.py"):
+    if _has_project_hook(hooks, "PreToolUse", "Bash", "codex_command_compress.py"):
         checks.append(_check("OK", "Feature: Bash compression", "enabled for PreToolUse(Bash)"))
     else:
         checks.append(_check("OK", "Feature: Bash compression", "off by default to avoid visible Codex PreToolUse hook spam"))
@@ -380,7 +383,7 @@ def _has_project_hook(hooks: dict[str, Any], event: str, matcher: str | None, co
             command = hook.get("command", "")
             if not isinstance(command, str):
                 continue
-            bundled = event in ('Stop', 'UserPromptSubmit', 'SubagentStart', 'SubagentStop') and 'token-optimizer/scripts/windows-launcher' in command
+            bundled = event in ('Stop', 'UserPromptSubmit', 'SubagentStart', 'SubagentStop', 'PreCompact', 'PostCompact', 'Interrupt', 'PreToolUse') and 'token-optimizer/scripts/windows-launcher' in command
             runner = {'Stop': 'stop_runner.py', 'UserPromptSubmit': 'userpromptsubmit_runner.py'}.get(event)
             if command_needle in command or bundled or (runner and runner in command):
                 return True

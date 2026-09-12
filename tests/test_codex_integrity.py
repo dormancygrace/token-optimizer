@@ -52,6 +52,8 @@ def test_latest_session_is_selected_before_limit(tmp_path, monkeypatch):
     assert cs.find_all_jsonl_files(days=90, max_files=1)[0][0] == new
 
 def test_large_log_samples_recent_usage_without_cumulative_overcount(tmp_path, monkeypatch):
+    import codex_log_index
+    monkeypatch.setattr(codex_log_index, 'records', lambda path: (_ for _ in ()).throw(OSError('busy index')))
     monkeypatch.setattr(cs, 'MAX_PARSE_FILE_BYTES', 2048)
     monkeypatch.setattr(cs, 'LARGE_FILE_TAIL_BYTES', 1500)
     p = tmp_path / 'large.jsonl'

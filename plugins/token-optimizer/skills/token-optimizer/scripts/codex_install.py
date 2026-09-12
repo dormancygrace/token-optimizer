@@ -21,7 +21,7 @@ from runtime_env import codex_home
 TOKEN_OPTIMIZER_MARKER = "token-optimizer/scripts"
 SUPPORTED_EVENTS = (
     "PreToolUse", "SessionStart", "UserPromptSubmit", "PostToolUse", "Stop",
-    "SessionEnd", "StopFailure", "SubagentStart", "SubagentStop",
+    "SessionEnd", "StopFailure", "SubagentStart", "SubagentStop", "PreCompact", "PostCompact", "Interrupt",
 )
 
 # A Codex marketplace install lives in a versioned directory
@@ -164,7 +164,7 @@ def _managed_hooks(
     same diagnostics-routing, systemMessage-preservation, and process-
     consolidation fixes as Claude Code. SubagentStart/Stop remain on the
     Codex-specific bridge (no runner exists for subagent events). Bash
-    compression stays explicit opt-in (Codex cannot rewrite command input yet).
+    compression uses Codex updatedInput and remains an explicit opt-in.
     """
     hooks = {
         "Stop": [
@@ -183,6 +183,10 @@ def _managed_hooks(
         ],
     }
     if enable_prompt_hooks:
+        for event, action in (('PreCompact', 'pre-compact'), ('PostCompact', 'post-compact'), ('Interrupt', 'interrupt')):
+            hooks[event] = [{'hooks': [{'type': 'command',
+                'command': _hook_command('skills/token-optimizer/scripts/codex_hook_bridge.py', action),
+                'timeout': 10}]}]
         hooks.update({
         "SessionStart": [
             {
@@ -275,7 +279,7 @@ def _managed_hooks(
                     {
                         "type": "command",
                         "command": _hook_command(
-                            "skills/token-optimizer/scripts/bash_hook.py",
+                            "skills/token-optimizer/scripts/codex_command_compress.py",
                             "--quiet",
                         ),
                         "timeout": 8,
@@ -481,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Hook profile: aggressive=max savings, all silent hooks (default); "
             "balanced=Stop+prompt hooks; quiet=Stop only; telemetry=Stop+PostToolUse. "
             "Bash compression stays opt-in (--enable-bash-compression) on every profile "
-            "because Codex cannot rewrite command input yet."
+            "to preserve the user's existing command-output workflow."
         ),
     )
     parser.add_argument("--skip-compact-prompt", action="store_true", help="Do not install Codex compact prompt")
@@ -489,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-bash-compression",
         action="store_true",
-        help="Experimental visible PreToolUse(Bash) hook; Codex does not yet support command rewriting",
+        help="Compress eligible inspection commands through Codex updatedInput; preserves full originals and failures",
     )
     parser.add_argument("--disable-bash-compression", action="store_true", help="Deprecated no-op; Bash compression is off by default")
     parser.add_argument("--enable-hot-path-hooks", action="store_true", help="Opt into visible PostToolUse tool-output hooks")
@@ -524,11 +528,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             enable_prompt_hooks = args.enable_prompt_hooks or args.profile in {"balanced", "aggressive"}
             enable_hot_path_hooks = args.enable_hot_path_hooks or args.profile in {"telemetry", "aggressive"}
-            # Bash compression stays explicit opt-in on every profile (including
-            # aggressive): Codex PreToolUse cannot rewrite command input yet, so the
-            # hook is non-functional AND visible. Enabling it by default would add a
-            # visible row per Bash call with no token saving. Re-couple to the
-            # aggressive profile once Codex supports input rewriting.
+            # Command rewriting is supported by current Codex. Keep its activation
+            # explicit because it changes the model-visible output of commands.
             enable_bash_compression = args.enable_bash_compression
             enable_subagent_hooks = (
                 args.enable_subagent_hooks or args.profile in {"balanced", "aggressive"}

@@ -3894,7 +3894,7 @@ var DB = (function() {
     var gitCommits = (data.trends && data.trends.git_commits) || {};
     var isCodex = data.runtime === 'codex';
 
-    var html = (isCodex ? '<p>Codex subscription: token counts are telemetry, not charges or quota percentages. API estimates are optional comparisons. Sessions marked "recent sample" contain only the tail of a large log; period totals are partial.</p>' : '') + '<table class="session-table"><thead><tr>' +
+    var html = (isCodex ? '<p>Codex subscription: token counts are telemetry, not charges or quota percentages. API estimates are optional comparisons. Large logs are indexed incrementally from the beginning. Sessions marked "partial" are still indexing or contain unreadable records; their totals are partial.</p>' : '') + '<table class="session-table"><thead><tr>' +
       '<th>Date</th><th>Sessions</th><th>Input Tokens</th><th>Output Tokens</th><th>' + (isCodex ? 'API comparison' : 'Cost') + '</th>' +
       (isCodex ? '<th>Cache</th>' : '<th>Skills Used</th>') +
       '<th>Commits</th>' +
@@ -3957,7 +3957,7 @@ var DB = (function() {
         '</tr></thead><tbody>';
       (d.session_details || []).forEach(function(sd, si) {
         var sdTopic = sd.topic || '';
-        if (isCodex && sd.incomplete) sdTopic = '[recent sample] ' + sdTopic;
+        if (isCodex && sd.incomplete) sdTopic = '[partial] ' + sdTopic;
         // Quality overlay
         var qs = sd.quality_score || 0;
         var qGrade = sd.quality_grade || (qs >= 90 ? 'S' : qs >= 80 ? 'A' : qs >= 70 ? 'B' : qs >= 55 ? 'C' : qs >= 40 ? 'D' : 'F');

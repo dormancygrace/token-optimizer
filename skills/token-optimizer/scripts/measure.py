@@ -3320,6 +3320,8 @@ def _interpolate_curve(value, curve):
 
 def _quality_curve_for_model(model):
     m = str(model or "").lower()
+    if detect_runtime() == 'codex':
+        return 'codex-context-headroom (heuristic, not model accuracy)', [(0, 98), (1, 76)], 'fill_fraction'
     if 'gpt-5.6' in m or 'daybreak' in m or m == 'gpt-reserve':
         return 'openai-gpt-5.5-proxy (uncalibrated)', _OPENAI_GPT55_MRCR_TOKENS, 'absolute_tokens'
     if 'gpt-6-astra' in m:
@@ -5581,10 +5583,10 @@ def _collect_codex_hook_status_for_dashboard():
             "uninstall_cmd": "Edit ~/.codex/config.toml and remove compact_prompt / experimental_compact_prompt_file",
         },
         "codex_bash_compression": {
-            "installed": "PreToolUse" in hooks_text and "bash_hook.py" in hooks_text,
+            "installed": "PreToolUse" in hooks_text and ("codex_command_compress.py" in hooks_text or "token-optimizer/scripts/windows-launcher" in hooks_text),
             "partial": False,
-            "label": "Experimental Bash Compression",
-            "description": "Codex PreToolUse currently cannot rewrite command input, so true invisible Bash compression is not available yet. This hook is experimental and visible.",
+            "label": "Codex Command Compression",
+            "description": "Compresses eligible inspection commands using updatedInput. Full originals are archived; failures and stderr are preserved.",
             "install_cmd": base + " --enable-bash-compression",
             "uninstall_cmd": base + " --disable-bash-compression",
         },
@@ -7868,8 +7870,8 @@ def _generate_codex_auto_recommendations(components, trends=None, days=30):
         )
     deep.append(
         "**Do not promise invisible Bash compression in Codex yet**: "
-        "Codex PreToolUse can block commands, but current Codex docs/source say `updatedInput` is parsed and not supported. "
-        "So true invisible command rewriting is not available today. Track Bash output bloat from JSONL/PostToolUse and keep compression as an experimental opt-in until Codex supports input rewriting."
+        "Codex PreToolUse supports updatedInput. Enable the native command adapter for eligible inspection commands; "
+        "it preserves exit codes and full archived output. Commands outside the supported set run unchanged."
     )
 
     habits.append(
@@ -9831,7 +9833,7 @@ def _parse_session_jsonl(filepath, window_start=None, window_end=None):
         if window_start is not None or window_end is not None:
             return None  # This adapter does not yet support activity slicing.
         result = codex_session.parse_session_jsonl(filepath)
-        if cache_key is not None:
+        if cache_key is not None and result and not result.get('incomplete'):
             if len(_parse_session_jsonl_cache) >= _PARSE_CACHE_MAX:
                 _parse_session_jsonl_cache.clear()
             _parse_session_jsonl_cache[cache_key] = result
@@ -18893,6 +18895,10 @@ def _is_file_collected(conn, jsonl_path, check_mtime=False):
     try:
         collected = datetime.fromisoformat(row[0]).timestamp()
         path = Path(jsonl_path)
+        if detect_runtime() == 'codex' and path.stat().st_size > codex_session.MAX_PARSE_FILE_BYTES:
+            import codex_log_index
+            if codex_log_index.pending(path):
+                return False
         paths = [path, *_find_subagent_jsonl_files(path)]
         return all(path.stat().st_mtime <= collected for path in paths)
     except (OSError, TypeError, ValueError):
@@ -29679,6 +29685,10 @@ def compute_quality_score(quality_data, session_id=None):
         signals[k] * _RESOURCE_HEALTH_WEIGHTS[k]
         for k in _RESOURCE_HEALTH_WEIGHTS
     )
+    if detect_runtime() == 'codex':
+        # No empirical information-loss curve exists for each current model.
+        # Report headroom/waste pressure, not a guessed accuracy penalty per compact.
+        resource_health = (signals['context_fill_degradation'] * 0.5 + signals['absolute_waste_tokens'] * 0.2) / 0.7
     session_efficiency = sum(
         signals[k] * _SESSION_EFFICIENCY_WEIGHTS[k]
         for k in _SESSION_EFFICIENCY_WEIGHTS
@@ -29694,6 +29704,10 @@ def compute_quality_score(quality_data, session_id=None):
         compaction_loss_pct = 95  # near-total
 
     band_name, _ = _degradation_band(fill_pct)
+    if detect_runtime() == 'codex':
+        fill_quality = None
+        compaction_loss_pct = None
+        band_name = 'HIGH CONTEXT PRESSURE' if fill_pct >= 0.8 else 'MODERATE CONTEXT PRESSURE' if fill_pct >= 0.5 else 'CONTEXT HEADROOM AVAILABLE'
 
     breakdown = {
         "context_fill_degradation": {
@@ -29738,7 +29752,7 @@ def compute_quality_score(quality_data, session_id=None):
             "compactions": compactions,
             "cumulative_loss_pct": compaction_loss_pct,
             "detail": (
-                f"{compactions} compaction(s) (~{compaction_loss_pct}% cumulative context loss)"
+                (f"{compactions} compaction(s); information loss is not measured" if compaction_loss_pct is None else f"{compactions} compaction(s) (~{compaction_loss_pct}% cumulative context loss)")
                 if compactions > 0 else "No compactions"
             ),
         },
@@ -29805,6 +29819,8 @@ def compute_quality_score(quality_data, session_id=None):
             "fill_pct": round(fill_pct * 100, 1),
             "message": "System prompt erosion accelerating, middle content at highest risk",
         }
+    if detect_runtime() == 'codex':
+        regime_change = None
 
     rh_rounded = round(resource_health, 1)
     se_rounded = round(session_efficiency, 1)
@@ -29813,6 +29829,7 @@ def compute_quality_score(quality_data, session_id=None):
 
     return {
         "score": rh_rounded,
+        "score_basis": 'context headroom and estimated waste; not model accuracy' if detect_runtime() == 'codex' else 'resource health heuristic',
         "grade": rh_grade,
         "resource_health": rh_rounded,
         "resource_health_grade": rh_grade,
@@ -37719,6 +37736,8 @@ def _maybe_nudge(result, cache_path, quality_data, quiet=False):
         verified=False,
     )
 
+    if detect_runtime() == "codex":
+        return f"[Token Optimizer] Context resource health {score}/100 (was {previous_score}); fill {fill_pct:.0f}%. Consider /compact."
     return f"[Token Optimizer] Quality {score} (was {previous_score}). /compact."
 
 
@@ -38193,7 +38212,9 @@ def quality_cache(throttle_seconds=120, warn_threshold=70, quiet=False, session_
             except Exception:
                 pass
             if _emit_warn:
-                if result["score"] < 50:
+                if detect_runtime() == "codex":
+                    print(f"[Token Optimizer] Context resource health {result['score']}/100; fill {result.get('fill_pct', 0):.0f}%. Consider /compact.")
+                elif result["score"] < 50:
                     print(f"[Token Optimizer] Quality {result['score']}/100 (critical). /clear with checkpoint.")
                 else:
                     print(f"[Token Optimizer] Quality {result['score']}/100. /compact.")
@@ -39339,19 +39360,20 @@ def _get_v5_feature_status():
                 status[name]["managed_by_hooks"] = True
                 status[name]["how"] = "Requires the Codex UserPromptSubmit hook. The default balanced Codex install enables it; quiet mode disables live quality nudges."
             elif name == "bash_compress":
-                hook_enabled = "PreToolUse" in codex_hooks_text and "bash_hook.py" in codex_hooks_text
-                status[name]["enabled"] = False
-                status[name]["recommended"] = False
-                status[name]["source"] = "codex experimental hook" if hook_enabled else "codex api gap"
-                status[name]["value"] = "Codex currently reports Bash usage, but true invisible Bash command rewriting is not supported yet."
-                status[name]["how"] = "Codex PreToolUse can block commands, but current Codex support does not apply updatedInput, so invisible Bash compression stays experimental and opt-in."
+                hook_enabled = "PreToolUse" in codex_hooks_text and ("codex_command_compress.py" in codex_hooks_text or "token-optimizer/scripts/windows-launcher" in codex_hooks_text)
+                status[name]["enabled"] = hook_enabled and enabled
+                status[name]["recommended"] = not hook_enabled
+                status[name]["managed_by_hooks"] = True
+                status[name]["source"] = "codex hook" if hook_enabled else "codex opt-in"
+                status[name]["value"] = "Native command output compression with full originals and failure preservation."
+                status[name]["how"] = "Install the PreToolUse adapter with --enable-bash-compression, then review and trust the new hook in Codex."
             elif name in {"delta_mode", "structure_map_beta"}:
                 status[name]["enabled"] = False
                 status[name]["recommended"] = False
                 status[name]["source"] = "codex api gap"
                 status[name]["unavailable"] = True
-                status[name]["value"] = "Not yet active in Codex. Token Optimizer measures the gap, but safe substitution needs richer Codex hook payloads."
-                status[name]["how"] = "Claude can intercept read flows for this feature. Current Codex hooks do not expose Read tool payloads or a safe response-substitution path, so Token Optimizer will not pretend to enable it."
+                status[name]["value"] = "Claude read-substitution adapter is not enabled in Codex."
+                status[name]["how"] = "Codex has shell/MCP hooks but no universal Read-result substitution contract. Native command compression handles eligible shell reads; this separate Claude feature remains unavailable."
     return status
 
 
@@ -39706,6 +39728,7 @@ _LEGACY_SAVINGS_LABELS = {
 # written by read_cache.py / measure.py v5 paths. Keys must match the
 # `feature=` strings passed to _log_compression_event().
 _V5_COMPRESSION_LABELS = {
+    "codex_command_compress": "Codex command output compression",
     "delta_read": "Delta reads",
     "quality_nudge": "Quality nudges",
     "loop_detection": "Loop detection",

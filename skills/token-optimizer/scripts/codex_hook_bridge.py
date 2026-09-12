@@ -283,6 +283,19 @@ def handle_subagent_stop() -> None:
     # Stop only updates the count log; never emits output.
 
 
+def handle_compaction(event):
+    payload = read_stdin_hook_input() or {}
+    sid = payload.get('session_id')
+    transcript = codex_session.resolve_session(payload.get('transcript_path'), sid)
+    if not sid or not transcript:
+        return
+    if event in ('PreCompact', 'Interrupt'):
+        _capture_stdout(measure.compact_capture, transcript_path=str(transcript), session_id=sid,
+                        cwd=payload.get('cwd'), trigger='pre-compact' if event == 'PreCompact' else 'interrupt')
+    else:
+        _capture_stdout(measure.quality_cache, session_jsonl=str(transcript), session_id=sid, force=True, quiet=True)
+
+
 def main() -> int:
     try:
         try:
@@ -302,6 +315,8 @@ def main() -> int:
             handle_subagent_start()
         elif command == "subagent-stop":
             handle_subagent_stop()
+        elif command in ('pre-compact', 'post-compact', 'interrupt'):
+            handle_compaction({'pre-compact': 'PreCompact', 'post-compact': 'PostCompact', 'interrupt': 'Interrupt'}[command])
     except Exception as exc:
         print(f"[Token Optimizer] Codex hook bridge failed: {exc}", file=sys.stderr)
     return 0
