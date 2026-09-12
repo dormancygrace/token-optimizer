@@ -163,3 +163,42 @@ def test_collect_windows_sessions_real_spawn():
     sessions = measure._collect_windows_claude_sessions()
 
     assert isinstance(sessions, list)
+
+
+def test_windows_codex_processes_exclude_claude_and_helpers(monkeypatch):
+    measure = _load_measure()
+    rows = ('"Id","ProcessName","SessionId","StartTime"\n'
+            '"11","codex","1","2020-01-01T00:00:00Z"\n'
+            '"12","Codex.exe","1","2020-01-01T00:00:00Z"\n'
+            '"13","claude","1","2020-01-01T00:00:00Z"\n'
+            '"14","codex-helper","1","2020-01-01T00:00:00Z"\n')
+    calls = []
+    monkeypatch.setattr(measure.subprocess, "run", _fake_run_factory(calls, rows))
+    found = measure._collect_windows_claude_sessions(process_name="codex")
+    assert [p["pid"] for p in found] == [11, 12]
+    assert "'codex*'" in calls[0][0][-1]
+
+
+def test_codex_health_passes_runtime_and_never_marks_shared_host_stale(monkeypatch):
+    measure = _load_measure()
+    monkeypatch.setattr(measure, "detect_runtime", lambda: "codex")
+    monkeypatch.setattr(measure.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(measure.subprocess, "run", _fake_run_factory([], ""))
+    calls = []
+    monkeypatch.setattr(measure, "_collect_windows_claude_sessions", lambda **kw:
+        calls.append(kw) or [{"pid": 123, "elapsed_seconds": 300000, "has_terminal": False}])
+    health = measure._collect_health_data()
+    assert calls == [{"process_name": "codex"}]
+    assert health["running_sessions"][0]["flags"] == ["RUNNING"]
+    assert not health["recommendations"]
+
+
+def test_kill_stale_does_not_terminate_codex_host(monkeypatch, capsys):
+    measure = _load_measure()
+    monkeypatch.setattr(measure, "detect_runtime", lambda: "codex")
+    def forbidden(*a, **kw):
+        pytest.fail("Codex processes must not be terminated based on age")
+    monkeypatch.setattr(measure.os, "kill", forbidden)
+    monkeypatch.setattr(measure, "_collect_health_data", forbidden)
+    measure.kill_stale_sessions(threshold_hours=0)
+    assert "automatic termination is disabled" in capsys.readouterr().out

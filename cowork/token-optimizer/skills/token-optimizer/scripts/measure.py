@@ -22004,8 +22004,8 @@ def _windows_process_creation(pid):
     return {}
 
 
-def _collect_windows_claude_sessions():
-    """Collect running Claude CLI sessions on Windows via PowerShell Get-Process.
+def _collect_windows_claude_sessions(process_name="claude"):
+    """Collect runtime processes on Windows via PowerShell Get-Process.
 
     Safety invariants:
     - Only matches on the process image name (claude / claude-*).
@@ -22036,13 +22036,15 @@ def _collect_windows_claude_sessions():
     import csv as _csv
     import io as _io
 
+    if process_name not in ("claude", "codex"):
+        raise ValueError("Unsupported runtime process name")
     sessions = []
     ps_cmd = (
         # -Name 'claude*' filters server-side (only candidate processes are
         # ever materialized), so the "touches only candidates" claim is real,
         # not a post-enumeration Where-Object. -ErrorAction SilentlyContinue
         # keeps a zero-match run from erroring.
-        "Get-Process -Name 'claude*' -ErrorAction SilentlyContinue | "
+        f"Get-Process -Name '{process_name}*' -ErrorAction SilentlyContinue | "
         "Select-Object Id, ProcessName, SessionId, "
         "@{N='StartTime';E={try { $_.StartTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } catch { '' }}} | "
         "ConvertTo-Csv -NoTypeInformation"
@@ -22071,10 +22073,12 @@ def _collect_windows_claude_sessions():
         start_time = (row.get("StartTime") or "").strip()
         image_lower = image_name.lower()
         # Strict image-name match only. See docstring invariants.
-        if not (image_lower == "claude.exe"
+        matches = image_lower in ("codex", "codex.exe") if process_name == "codex" else (
+                image_lower == "claude.exe"
                 or image_lower == "claude"
                 or image_lower.startswith("claude.")
-                or image_lower.startswith("claude-")):
+                or image_lower.startswith("claude-"))
+        if not matches:
             continue
         try:
             pid = int(pid_str.replace(",", "").strip())
@@ -22191,7 +22195,8 @@ def _collect_health_data():
         pass
 
     if system == "Windows":
-        running_sessions = _collect_windows_claude_sessions()
+        running_sessions = (_collect_windows_claude_sessions(process_name="codex")
+                            if runtime == "codex" else _collect_windows_claude_sessions())
     else:
         running_sessions = _collect_posix_claude_sessions(process_name=process_name)
         if running_sessions is None:
@@ -22227,6 +22232,11 @@ def _collect_health_data():
 
     # Flag sessions
     for s in running_sessions:
+        if runtime == "codex":
+            # Desktop app-server lifetime is not task age or evidence of an
+            # abandoned session. Never recommend killing shared Codex hosts.
+            s["flags"] = ["RUNNING"]
+            continue
         flags = []
         if s["version"] and installed_version and s["version"] != installed_version:
             flags.append("OUTDATED")
@@ -22514,6 +22524,9 @@ def kill_stale_sessions(threshold_hours=12, dry_run=False):
     """
     import signal
 
+    if detect_runtime() == "codex":
+        print("\n  Codex processes can host multiple active tasks. Process age cannot identify stale tasks; automatic termination is disabled.")
+        return
     health = _collect_health_data()
     if health is None:
         print("\n  Session health check is not supported on this platform.")

@@ -4884,12 +4884,13 @@ var DB = (function() {
 
     // Running sessions table
     var sessions = h.running_sessions || [];
-    html += '<div class="card wide"><div class="card-header"><span>Running Sessions</span><span class="label">' + sessions.length + ' active</span></div>';
+    html += '<div class="card wide"><div class="card-header"><span>' + (isCodex ? 'Running Codex Processes' : 'Running Sessions') + '</span><span class="label">' + sessions.length + (isCodex ? ' processes' : ' active') + '</span></div>';
+    if (isCodex) html += '<p style="font-size:13px;color:var(--c-text-dim)">One Codex process can host multiple tasks. This is a process count, not the number of open or actively running tasks.</p>';
 
     var staleCount = sessions.filter(function(s) { return (s.flags || []).some(function(f) { return f === 'STALE' || f === 'ZOMBIE'; }); }).length;
 
     if (sessions.length === 0) {
-      html += '<div class="empty-state">No running ' + esc(data.runtime_label || 'Claude Code') + ' sessions found.</div>';
+      html += '<div class="empty-state">' + (isCodex ? 'No Codex processes detected in the latest local snapshot.' : 'No running ' + esc(data.runtime_label || 'Claude Code') + ' sessions found.') + '</div>';
     } else {
       // Kill stale button + explanation
       if (staleCount > 0) {
@@ -4931,7 +4932,7 @@ var DB = (function() {
       });
       html += '</tbody></table>';
       // Flag legend
-      html += '<div style="font-size:11px;color:var(--c-text-dim);margin-top:var(--s-2);line-height:1.6;font-family:var(--font-mono)">' +
+      if (!isCodex) html += '<div style="font-size:11px;color:var(--c-text-dim);margin-top:var(--s-2);line-height:1.6;font-family:var(--font-mono)">' +
         '<span class="flag-badge terminal" style="font-size:10px">TERMINAL</span> = attached to a terminal tab (your active sessions) &nbsp; ' +
         '<span class="flag-badge" style="font-size:10px;background:rgba(125,140,163,0.2);color:var(--c-text-dim)">HEADLESS</span> = no terminal (automation/background) &nbsp; ' +
         '<span class="flag-badge stale" style="font-size:10px">STALE</span> = running 24h+ &nbsp; ' +
